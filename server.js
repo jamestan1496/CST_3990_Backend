@@ -30,7 +30,7 @@ app.use('/uploads', express.static('uploads'));
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jamestan1496:eventhive@cluster0.gf6vat2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-here';
-const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
+const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'https://cst-3990-pythonclustering.onrender.com';
 
 // File upload configuration
 const storage = multer.diskStorage({
