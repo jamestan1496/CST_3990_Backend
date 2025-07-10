@@ -282,44 +282,152 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // Event routes
-app.get('/api/events', async (req, res) => {
+// Replace your existing event creation route with this:
+app.post('/api/events', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
-    const { status, organizer, search } = req.query;
-    let filter = {};
+    const { title, description, date, time, location, maxAttendees, sessions } = req.body;
 
-    if (status) filter.status = status;
-    if (organizer) filter.organizer = organizer;
-    if (search) {
-      filter.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
-      ];
+    console.log('Creating event with date:', date, 'time:', time); // Debug log
+
+    // Validate that the event date is not in the past
+    const eventDate = new Date(date);
+    const currentDate = new Date();
+    
+    console.log('Event date:', eventDate); // Debug log
+    console.log('Current date:', currentDate); // Debug log
+    
+    // Set current date to start of day for comparison
+    currentDate.setHours(0, 0, 0, 0);
+    eventDate.setHours(0, 0, 0, 0);
+    
+    if (eventDate < currentDate) {
+      console.log('Date validation failed: Event date is in the past'); // Debug log
+      return res.status(400).json({ 
+        error: 'Cannot create event for a past date. Please select a current or future date.' 
+      });
     }
 
-    const events = await Event.find(filter)
-      .populate('organizer', 'firstName lastName email')
-      .sort({ date: 1 });
+    // Additional validation for time if event is today
+    if (eventDate.getTime() === currentDate.getTime() && time) {
+      const currentTime = new Date();
+      const [hours, minutes] = time.split(':');
+      const eventDateTime = new Date();
+      eventDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+      
+      console.log('Time validation - Event time:', eventDateTime, 'Current time:', currentTime); // Debug log
+      
+      if (eventDateTime < currentTime) {
+        console.log('Time validation failed: Event time is in the past'); // Debug log
+        return res.status(400).json({ 
+          error: 'Cannot create event for a past time today. Please select a future time.' 
+        });
+      }
+    }
 
-    res.json(events);
+    console.log('Date validation passed, creating event...'); // Debug log
+
+    const event = new Event({
+      title,
+      description,
+      date: new Date(date),
+      time,
+      location,
+      organizer: req.user.userId,
+      maxAttendees: maxAttendees || 100,
+      image: req.file ? req.file.filename : null,
+      sessions: sessions ? JSON.parse(sessions) : []
+    });
+
+    await event.save();
+    await event.populate('organizer', 'firstName lastName email');
+
+    console.log('Event created successfully:', event._id); // Debug log
+
+    res.status(201).json({
+      message: 'Event created successfully',
+      event
+    });
   } catch (error) {
-    console.error('Get events error:', error);
-    res.status(500).json({ error: 'Failed to fetch events' });
+    console.error('Create event error:', error);
+    res.status(500).json({ error: 'Failed to create event' });
   }
 });
 
-app.get('/api/events/:id', async (req, res) => {
+// Also replace your event update route:
+app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
-    const event = await Event.findById(req.params.id)
-      .populate('organizer', 'firstName lastName email');
+    const { title, description, date, time, location, maxAttendees, sessions, status } = req.body;
 
+    const event = await Event.findById(req.params.id);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    res.json(event);
+    if (event.organizer.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Not authorized to update this event' });
+    }
+
+    // Validate date if it's being updated
+    if (date) {
+      const eventDate = new Date(date);
+      const currentDate = new Date();
+      
+      // Set current date to start of day for comparison
+      currentDate.setHours(0, 0, 0, 0);
+      eventDate.setHours(0, 0, 0, 0);
+      
+      if (eventDate < currentDate) {
+        return res.status(400).json({ 
+          error: 'Cannot update event to a past date. Please select a current or future date.' 
+        });
+      }
+
+      // Additional validation for time if event is today and time is being updated
+      if (eventDate.getTime() === currentDate.getTime() && time) {
+        const currentTime = new Date();
+        const [hours, minutes] = time.split(':');
+        const eventDateTime = new Date();
+        eventDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+        
+        if (eventDateTime < currentTime) {
+          return res.status(400).json({ 
+            error: 'Cannot update event to a past time today. Please select a future time.' 
+          });
+        }
+      }
+    }
+
+    const updateData = {
+      title: title || event.title,
+      description: description || event.description,
+      date: date ? new Date(date) : event.date,
+      time: time || event.time,
+      location: location || event.location,
+      maxAttendees: maxAttendees || event.maxAttendees,
+      status: status || event.status
+    };
+
+    if (req.file) {
+      updateData.image = req.file.filename;
+    }
+
+    if (sessions) {
+      updateData.sessions = JSON.parse(sessions);
+    }
+
+    const updatedEvent = await Event.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true }
+    ).populate('organizer', 'firstName lastName email');
+
+    res.json({
+      message: 'Event updated successfully',
+      event: updatedEvent
+    });
   } catch (error) {
-    console.error('Get event error:', error);
-    res.status(500).json({ error: 'Failed to fetch event' });
+    console.error('Update event error:', error);
+    res.status(500).json({ error: 'Failed to update event' });
   }
 });
 
