@@ -9,6 +9,8 @@ const http = require('http');
 const axios = require('axios');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
+const path = require('path');
 
 // Initialize Express app
 const app = express();
@@ -24,7 +26,25 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static('uploads'));
+// Enhanced static file serving with better error handling
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+    // Add proper headers for images
+    setHeaders: (res, path, stat) => {
+        res.set({
+            'Cache-Control': 'public, max-age=86400', // Cache for 1 day
+            'Cross-Origin-Resource-Policy': 'cross-origin'
+        });
+    },
+    // Handle missing files gracefully
+    fallthrough: false
+}));
+app.use('/uploads', (req, res, next) => {
+    res.status(404).json({ 
+        error: 'Image not found',
+        path: req.path,
+        suggestion: 'The image may have been deleted or the filename is incorrect'
+    });
+});
 
 // Configuration
 const PORT = process.env.PORT || 5000;
@@ -32,16 +52,47 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jamestan1496:event
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-here';
 const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
 
+// Create uploads directory if it doesn't exist (add this after your middleware setup)
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    console.log('Created uploads directory:', uploadsDir);
+}
 // File upload configuration
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/');
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
-  }
+    destination: function (req, file, cb) {
+        const uploadsPath = path.join(__dirname, 'uploads');
+        // Ensure directory exists
+        if (!fs.existsSync(uploadsPath)) {
+            fs.mkdirSync(uploadsPath, { recursive: true });
+        }
+        cb(null, uploadsPath);
+    },
+    filename: function (req, file, cb) {
+        // Create unique filename with original extension
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const extension = path.extname(file.originalname);
+        const filename = uniqueSuffix + extension;
+        
+        console.log('Storing file as:', filename);
+        cb(null, filename);
+    }
 });
-const upload = multer({ storage: storage });
+const upload = multer({ 
+    storage: storage,
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        // Check file type
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.'));
+        }
+    }
+});
 
 // MongoDB connection
 mongoose.connect(MONGODB_URI, {
@@ -1121,6 +1172,26 @@ app.get('/api/events/:eventId/my-registration', authenticateToken, async (req, r
     console.error('Get my registration error:', error);
     res.status(500).json({ error: 'Failed to fetch registration' });
   }
+});
+app.get('/api/test-uploads', (req, res) => {
+    const uploadsPath = path.join(__dirname, 'uploads');
+    
+    try {
+        const files = fs.readdirSync(uploadsPath);
+        res.json({
+            uploadsDirectory: uploadsPath,
+            exists: fs.existsSync(uploadsPath),
+            fileCount: files.length,
+            files: files.slice(0, 10), // Show first 10 files
+            permissions: fs.constants.F_OK
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Could not read uploads directory',
+            details: error.message,
+            uploadsPath
+        });
+    }
 });
 
 // Health check endpoint
