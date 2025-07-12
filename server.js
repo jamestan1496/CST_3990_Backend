@@ -283,6 +283,68 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Event routes
 // Replace your existing event creation route with this:
+// Get all events (for attendees to browse and register)
+app.get('/api/events', async (req, res) => {
+  try {
+    const { search, status, limit = 50, page = 1 } = req.query;
+    
+    // Build filter object
+    const filter = {};
+    
+    // Add search filter
+    if (search && search.trim()) {
+      filter.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { location: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    // Add status filter
+    if (status) {
+      filter.status = status;
+    }
+    
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Get events with organizer info
+    const events = await Event.find(filter)
+      .populate('organizer', 'firstName lastName email')
+      .sort({ date: 1 }) // Sort by date ascending
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    // Get total count for pagination
+    const total = await Event.countDocuments(filter);
+    
+    // Add attendee count to each event
+    const eventsWithCounts = await Promise.all(
+      events.map(async (event) => {
+        const attendeeCount = await Registration.countDocuments({ event: event._id });
+        const eventObj = event.toObject();
+        return {
+          ...eventObj,
+          attendeeCount,
+          spotsRemaining: event.maxAttendees - attendeeCount
+        };
+      })
+    );
+    
+    res.json({
+      events: eventsWithCounts,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get events error:', error);
+    res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
 app.post('/api/events', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
     const { title, description, date, time, location, maxAttendees, sessions } = req.body;
