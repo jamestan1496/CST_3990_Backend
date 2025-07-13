@@ -49,7 +49,7 @@ app.use('/uploads', (req, res, next) => {
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jamestan1496:eventhive@cluster0.gf6vat2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-here';
-const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
+const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'https://cst-3990-pythonclustering.onrender.com';
 
 // Create uploads directory if it doesn't exist (add this after your middleware setup)
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -926,7 +926,9 @@ app.post('/api/events/:eventId/checkin-manual', authenticateToken, authorizeRole
 app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
   try {
     const eventId = req.params.eventId;
-    const { algorithm = 'kmeans', numClusters = 3 } = req.body;
+    const { algorithm = 'kmeans', numClusters = 3, eps = 0.5, minSamples = 2 } = req.body;
+
+    console.log(`Starting clustering for event ${eventId} with algorithm: ${algorithm}`);
 
     // Verify organizer owns the event
     const event = await Event.findById(eventId);
@@ -942,89 +944,140 @@ app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['orga
       return res.status(400).json({ error: 'No registrations found for clustering' });
     }
 
-    // Prepare data for clustering
-    const attendeeData = registrations.map(reg => ({
-      id: reg.attendee._id,
-      name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
-      email: reg.attendee.email,
-      interests: reg.attendee.interests || [],
-      professionalRole: reg.attendee.professionalRole || 'unknown'
-    }));
-
-    console.log(`Starting clustering for ${attendeeData.length} attendees`);
-
-    // Enhanced fallback clustering with better logic
-    const clusterMap = new Map();
-    const clusters = [];
-    
-    // Group by professional role first
-    attendeeData.forEach(attendee => {
-      const key = attendee.professionalRole && attendee.professionalRole !== 'unknown' 
-        ? attendee.professionalRole.toLowerCase() 
-        : 'general';
-      
-      if (!clusterMap.has(key)) {
-        clusterMap.set(key, []);
-      }
-      clusterMap.get(key).push(attendee.id);
-    });
-
-    // Convert to array format and ensure we don't exceed numClusters
-    let clusterArray = Array.from(clusterMap.values());
-    
-    // If we have too many clusters, merge smaller ones
-    if (clusterArray.length > numClusters) {
-      // Sort by size and merge smaller clusters
-      clusterArray.sort((a, b) => b.length - a.length);
-      
-      const mainClusters = clusterArray.slice(0, numClusters - 1);
-      const mergedCluster = clusterArray.slice(numClusters - 1).flat();
-      
-      if (mergedCluster.length > 0) {
-        mainClusters.push(mergedCluster);
-      }
-      
-      clusterArray = mainClusters;
+    if (registrations.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 attendees for clustering' });
     }
 
-    // Update registrations with cluster assignments
-    for (let i = 0; i < clusterArray.length; i++) {
-      const cluster = clusterArray[i];
-      for (const attendeeId of cluster) {
-        await Registration.findOneAndUpdate(
-          { event: eventId, attendee: attendeeId },
-          { cluster: `cluster_${i}` }
-        );
+    // Prepare data for clustering service
+    const attendeeData = registrations.map(reg => {
+      if (!reg.attendee) {
+        console.warn(`Registration ${reg._id} has missing attendee data`);
+        return null;
       }
+      
+      return {
+        id: reg.attendee._id.toString(),
+        name: `${reg.attendee.firstName || 'Unknown'} ${reg.attendee.lastName || 'User'}`,
+        email: reg.attendee.email || '',
+        interests: reg.attendee.interests || [],
+        professionalRole: reg.attendee.professionalRole || 'unknown'
+      };
+    }).filter(Boolean); // Remove null entries
+
+    if (attendeeData.length < 2) {
+      return res.status(400).json({ error: 'Insufficient valid attendee data for clustering' });
     }
 
-    const metrics = {
-      totalPoints: attendeeData.length,
-      numClusters: clusterArray.length,
-      avgClusterSize: Math.round(attendeeData.length / clusterArray.length),
-      silhouetteScore: 0.7 + Math.random() * 0.2 // Mock score between 0.7-0.9
-    };
+    console.log(`Prepared ${attendeeData.length} attendees for clustering`);
 
-    console.log(`Clustering completed: ${clusterArray.length} clusters created`);
+    try {
+      // Call the clustering microservice
+      const clusteringPayload = {
+        data: attendeeData,
+        algorithm: algorithm,
+        numClusters: numClusters,
+        eps: eps,
+        minSamples: minSamples
+      };
 
-    res.json({
-      message: 'Clustering completed successfully',
-      clusters: clusterArray,
-      metrics,
-      totalAttendees: attendeeData.length,
-      algorithm: 'rule-based-fallback'
-    });
+      console.log(`Calling clustering service at ${CLUSTERING_SERVICE_URL}/cluster`);
+      
+      const clusteringResponse = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster`, clusteringPayload, {
+        timeout: 30000, // 30 second timeout
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const { clusters, cluster_info, metrics } = clusteringResponse.data;
+      
+      console.log(`Clustering service returned ${clusters.length} clusters`);
+
+      // Update registrations with cluster assignments
+      for (let i = 0; i < clusters.length; i++) {
+        const cluster = clusters[i];
+        for (const attendeeId of cluster) {
+          try {
+            await Registration.findOneAndUpdate(
+              { event: eventId, attendee: attendeeId },
+              { cluster: `ai_cluster_${i}` }
+            );
+          } catch (updateError) {
+            console.warn(`Failed to update cluster for attendee ${attendeeId}:`, updateError);
+          }
+        }
+      }
+
+      // Store clustering results in database for future reference
+      try {
+        await Event.findByIdAndUpdate(eventId, {
+          $set: {
+            clusteringResults: {
+              algorithm: algorithm,
+              metrics: metrics,
+              clusterInfo: cluster_info,
+              timestamp: new Date(),
+              totalClusters: clusters.length
+            }
+          }
+        });
+      } catch (storeError) {
+        console.warn('Failed to store clustering results:', storeError);
+      }
+
+      // Emit real-time update to connected clients
+      io.to(eventId).emit('clustering_complete', {
+        eventId: eventId,
+        clustersCount: clusters.length,
+        algorithm: algorithm,
+        metrics: metrics
+      });
+
+      res.json({
+        message: 'AI clustering completed successfully',
+        clusters,
+        cluster_info,
+        metrics: {
+          ...metrics,
+          service_used: 'AI Clustering Service',
+          algorithm_details: {
+            name: algorithm,
+            parameters: algorithm === 'kmeans' ? { numClusters } : { eps, minSamples }
+          }
+        },
+        totalAttendees: attendeeData.length
+      });
+
+    } catch (clusteringError) {
+      console.error('Clustering service error:', clusteringError.message);
+      
+      // Check if it's a timeout or connection error
+      if (clusteringError.code === 'ECONNREFUSED' || clusteringError.code === 'ETIMEDOUT') {
+        console.log('Clustering service unavailable, falling back to simple clustering');
+        
+        // Fallback to enhanced simple clustering
+        const fallbackResult = await performFallbackClustering(attendeeData, numClusters, eventId);
+        
+        res.json({
+          message: 'Clustering completed using fallback method (AI service unavailable)',
+          ...fallbackResult,
+          service_used: 'Fallback Clustering',
+          note: 'AI clustering service was unavailable. Consider starting the clustering service for better results.'
+        });
+      } else {
+        throw clusteringError; // Re-throw if it's not a connection issue
+      }
+    }
 
   } catch (error) {
     console.error('Clustering error:', error);
     res.status(500).json({ 
       error: 'Clustering failed', 
       details: error.message,
-      suggestion: 'Try again with fewer clusters or check if attendees have professional roles set'
+      suggestion: 'Ensure the clustering service is running or try with fewer clusters'
     });
   }
 });
-
 app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => {
   try {
     const eventId = req.params.eventId;
@@ -1081,6 +1134,111 @@ app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => 
       error: 'Failed to fetch clusters',
       details: error.message 
     });
+  }
+});
+
+app.get('/api/clustering/algorithms', authenticateToken, async (req, res) => {
+  try {
+    const response = await axios.get(`${CLUSTERING_SERVICE_URL}/algorithms`, {
+      timeout: 5000
+    });
+    
+    res.json(response.data);
+  } catch (error) {
+    // Return default algorithms if service is unavailable
+    res.json({
+      algorithms: [
+        {
+          name: 'kmeans',
+          display_name: 'K-Means',
+          description: 'Partitions data into k clusters (AI service required)',
+          parameters: [
+            { name: 'numClusters', type: 'integer', default: 3, min: 2, max: 8 }
+          ],
+          available: false
+        },
+        {
+          name: 'fallback',
+          display_name: 'Role-Based Grouping',
+          description: 'Groups attendees by professional roles (always available)',
+          parameters: [
+            { name: 'numClusters', type: 'integer', default: 3, min: 2, max: 6 }
+          ],
+          available: true
+        }
+      ],
+      note: 'AI clustering service unavailable. Only fallback clustering is available.'
+    });
+  }
+});
+
+app.post('/api/events/:eventId/clusters/analyze', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
+  try {
+    const eventId = req.params.eventId;
+    
+    // Verify organizer owns the event
+    const event = await Event.findById(eventId);
+    if (!event || event.organizer.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    // Get clustered registrations
+    const registrations = await Registration.find({ 
+      event: eventId,
+      cluster: { $exists: true, $ne: null }
+    }).populate('attendee', 'firstName lastName email interests professionalRole');
+
+    if (registrations.length === 0) {
+      return res.status(400).json({ error: 'No clustered data found. Run clustering first.' });
+    }
+
+    // Prepare data for analysis
+    const attendeeData = registrations.map(reg => ({
+      id: reg.attendee._id.toString(),
+      name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
+      email: reg.attendee.email,
+      interests: reg.attendee.interests || [],
+      professionalRole: reg.attendee.professionalRole || 'unknown',
+      cluster: reg.cluster
+    }));
+
+    // Group by clusters
+    const clusterGroups = {};
+    attendeeData.forEach(attendee => {
+      if (!clusterGroups[attendee.cluster]) {
+        clusterGroups[attendee.cluster] = [];
+      }
+      clusterGroups[attendee.cluster].push(attendee);
+    });
+
+    const clusters = Object.values(clusterGroups);
+
+    try {
+      // Try to use AI service for analysis
+      const analysisResponse = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster/analyze`, {
+        clusters: clusters.map(cluster => cluster.map(a => a.id)),
+        attendeeData: attendeeData
+      }, { timeout: 10000 });
+
+      res.json({
+        ...analysisResponse.data,
+        source: 'AI Analysis Service'
+      });
+
+    } catch (serviceError) {
+      console.log('AI analysis service unavailable, using local analysis');
+      
+      // Fallback to local analysis
+      const localAnalysis = performLocalClusterAnalysis(clusters);
+      res.json({
+        ...localAnalysis,
+        source: 'Local Analysis (AI service unavailable)'
+      });
+    }
+
+  } catch (error) {
+    console.error('Cluster analysis error:', error);
+    res.status(500).json({ error: 'Analysis failed', details: error.message });
   }
 });
 
