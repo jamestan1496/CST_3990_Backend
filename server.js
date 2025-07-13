@@ -928,11 +928,17 @@ app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['orga
     const eventId = req.params.eventId;
     const { algorithm = 'kmeans', numClusters = 3 } = req.body;
 
-    console.log(`Starting AI clustering for event ${eventId}`);
+    console.log(`[CLUSTERING] Starting clustering for event ${eventId} with ${numClusters} clusters`);
 
-    // Verify organizer owns the event
+    // Verify event exists and user is organizer
     const event = await Event.findById(eventId);
-    if (!event || event.organizer.toString() !== req.user.userId) {
+    if (!event) {
+      console.log(`[CLUSTERING] Event ${eventId} not found`);
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    if (event.organizer.toString() !== req.user.userId) {
+      console.log(`[CLUSTERING] User ${req.user.userId} not authorized for event ${eventId}`);
       return res.status(403).json({ error: 'Not authorized' });
     }
 
@@ -940,172 +946,171 @@ app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['orga
     const registrations = await Registration.find({ event: eventId })
       .populate('attendee', 'firstName lastName email interests professionalRole');
 
-    if (registrations.length < 2) {
-      return res.status(400).json({ error: 'Need at least 2 attendees for clustering' });
+    console.log(`[CLUSTERING] Found ${registrations.length} total registrations`);
+
+    if (registrations.length === 0) {
+      return res.status(400).json({ error: 'No registrations found for clustering' });
     }
 
-    // Prepare data for AI service
-    const attendeeData = registrations
-      .filter(reg => reg.attendee) // Filter out null attendees
-      .map(reg => ({
-        id: reg.attendee._id.toString(),
-        name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
-        email: reg.attendee.email,
-        interests: reg.attendee.interests || [],
-        professionalRole: reg.attendee.professionalRole || 'unknown'
-      }));
-
-    console.log(`Prepared ${attendeeData.length} attendees for AI clustering`);
-
-    try {
-      // Call AI clustering service
-      const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
-      
-      console.log(`Calling AI service at: ${CLUSTERING_SERVICE_URL}`);
-      
-      const aiResponse = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster`, {
-        data: attendeeData,
-        algorithm: algorithm,
-        numClusters: numClusters
-      }, {
-        timeout: 30000,
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-      const { clusters, cluster_info, metrics } = aiResponse.data;
-      
-      console.log(`AI clustering successful: ${clusters.length} clusters`);
-
-      // Update database with cluster assignments
-      for (let i = 0; i < clusters.length; i++) {
-        const cluster = clusters[i];
-        for (const attendeeId of cluster) {
-          await Registration.findOneAndUpdate(
-            { event: eventId, attendee: attendeeId },
-            { cluster: `ai_cluster_${i}` }
-          );
-        }
+    // Filter valid registrations
+    const validRegistrations = registrations.filter(reg => {
+      if (!reg.attendee) {
+        console.warn(`[CLUSTERING] Registration ${reg._id} has missing attendee data`);
+        return false;
       }
-
-      res.json({
-        message: 'AI clustering completed successfully',
-        clusters,
-        cluster_info,
-        metrics: {
-          ...metrics,
-          service: 'AI Clustering Service',
-          algorithm_used: algorithm
-        },
-        totalAttendees: attendeeData.length
-      });
-
-    } catch (aiError) {
-      console.error('AI service failed:', aiError.message);
-      
-      // Fallback clustering
-      console.log('Using fallback clustering...');
-      
-      const fallbackClusters = performFallbackClustering(attendeeData, numClusters);
-      
-      // Update database with fallback clusters
-      for (let i = 0; i < fallbackClusters.length; i++) {
-        const cluster = fallbackClusters[i];
-        for (const attendeeId of cluster) {
-          await Registration.findOneAndUpdate(
-            { event: eventId, attendee: attendeeId },
-            { cluster: `fallback_cluster_${i}` }
-          );
-        }
+      if (!reg.attendee.firstName || !reg.attendee.lastName) {
+        console.warn(`[CLUSTERING] Attendee ${reg.attendee._id} has incomplete name data`);
+        return false;
       }
+      return true;
+    });
 
-      res.json({
-        message: 'Clustering completed using fallback method',
-        clusters: fallbackClusters,
-        metrics: {
-          service: 'Fallback Clustering',
-          totalAttendees: attendeeData.length,
-          note: 'AI service unavailable - used intelligent fallback'
-        },
-        totalAttendees: attendeeData.length
+    console.log(`[CLUSTERING] Found ${validRegistrations.length} valid registrations`);
+
+    if (validRegistrations.length < 2) {
+      return res.status(400).json({ 
+        error: 'Need at least 2 valid attendees for clustering',
+        details: `Found ${validRegistrations.length} valid attendees out of ${registrations.length} total`
       });
     }
+
+    // Prepare attendee data
+    const attendeeData = validRegistrations.map(reg => ({
+      id: reg.attendee._id.toString(),
+      name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
+      email: reg.attendee.email || '',
+      interests: Array.isArray(reg.attendee.interests) ? reg.attendee.interests : [],
+      professionalRole: reg.attendee.professionalRole || 'unknown'
+    }));
+
+    console.log(`[CLUSTERING] Prepared attendee data:`, attendeeData.map(a => ({ id: a.id, name: a.name, role: a.professionalRole })));
+
+    // Perform clustering
+    const clusters = performSmartClustering(attendeeData, numClusters);
+    console.log(`[CLUSTERING] Created ${clusters.length} clusters with sizes:`, clusters.map(c => c.length));
+
+    // Clear existing cluster assignments
+    await Registration.updateMany(
+      { event: eventId },
+      { $unset: { cluster: 1 } }
+    );
+
+    // Update registrations with new cluster assignments
+    let updateCount = 0;
+    for (let i = 0; i < clusters.length; i++) {
+      const cluster = clusters[i];
+      for (const attendeeId of cluster) {
+        try {
+          const updateResult = await Registration.findOneAndUpdate(
+            { event: eventId, attendee: attendeeId },
+            { cluster: `cluster_${i}` },
+            { new: true }
+          );
+          if (updateResult) {
+            updateCount++;
+          }
+        } catch (updateError) {
+          console.warn(`[CLUSTERING] Failed to update cluster for attendee ${attendeeId}:`, updateError.message);
+        }
+      }
+    }
+
+    console.log(`[CLUSTERING] Successfully updated ${updateCount} registrations with cluster assignments`);
+
+    // Generate cluster info
+    const clusterInfo = clusters.map((cluster, index) => {
+      const clusterMembers = attendeeData.filter(att => cluster.includes(att.id));
+      const roles = clusterMembers.map(m => m.professionalRole);
+      const interests = clusterMembers.flatMap(m => m.interests);
+      
+      return {
+        name: `cluster_${index}`,
+        size: cluster.length,
+        members: clusterMembers,
+        characteristics: {
+          dominantRole: getMostCommon(roles),
+          commonInterests: getMostCommonItems(interests, 3),
+          diversity: calculateDiversity(roles)
+        }
+      };
+    });
+
+    const metrics = {
+      totalAttendees: attendeeData.length,
+      numClusters: clusters.length,
+      avgClusterSize: Math.round(attendeeData.length / clusters.length),
+      algorithm: 'smart-fallback',
+      timestamp: new Date().toISOString(),
+      updateCount: updateCount
+    };
+
+    console.log(`[CLUSTERING] Clustering completed successfully`);
+
+    res.json({
+      message: 'Clustering completed successfully',
+      clusters,
+      cluster_info: clusterInfo,
+      metrics,
+      totalAttendees: attendeeData.length
+    });
 
   } catch (error) {
-    console.error('Clustering error:', error);
-    res.status(500).json({ error: 'Clustering failed', details: error.message });
+    console.error('[CLUSTERING] Error:', error);
+    res.status(500).json({ 
+      error: 'Clustering failed', 
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
-// Simple fallback clustering function
-function performFallbackClustering(attendeeData, numClusters) {
-  // Group by professional role
-  const roleGroups = new Map();
-  
-  attendeeData.forEach(attendee => {
-    const role = attendee.professionalRole || 'unknown';
-    if (!roleGroups.has(role)) {
-      roleGroups.set(role, []);
-    }
-    roleGroups.get(role).push(attendee.id);
-  });
-
-  let clusters = Array.from(roleGroups.values());
-  
-  // Balance to target number of clusters
-  if (clusters.length > numClusters) {
-    clusters.sort((a, b) => b.length - a.length);
-    const mainClusters = clusters.slice(0, numClusters - 1);
-    const merged = clusters.slice(numClusters - 1).flat();
-    if (merged.length > 0) mainClusters.push(merged);
-    clusters = mainClusters;
-  }
-  
-  return clusters;
-}
-
-// Health check for AI service
-app.get('/api/clustering/health', authenticateToken, async (req, res) => {
-  try {
-    const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL;
-    if (!CLUSTERING_SERVICE_URL) {
-      return res.json({ status: 'not_configured', message: 'Clustering service URL not set' });
-    }
-
-    const response = await axios.get(`${CLUSTERING_SERVICE_URL}/health`, { timeout: 5000 });
-    res.json({ status: 'healthy', ai_service: response.data });
-  } catch (error) {
-    res.json({ status: 'unavailable', error: error.message, fallback: 'available' });
-  }
-});
-// Enhanced clusters GET route
+// FIXED: Enhanced clusters GET route with comprehensive error handling
 app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => {
   try {
     const eventId = req.params.eventId;
+    console.log(`[CLUSTERS] Fetching clusters for event ${eventId} by user ${req.user.userId}`);
 
-    // Verify user has access
+    // Verify event exists
     const event = await Event.findById(eventId);
     if (!event) {
+      console.log(`[CLUSTERS] Event ${eventId} not found`);
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Check if user is organizer or attendee of the event
+    // Check access permissions
     const isOrganizer = event.organizer.toString() === req.user.userId;
-    const isAttendee = !isOrganizer && req.user.role === 'attendee';
-    
-    if (!isOrganizer && !isAttendee) {
+    const isRegisteredAttendee = await Registration.findOne({ 
+      event: eventId, 
+      attendee: req.user.userId 
+    });
+
+    if (!isOrganizer && !isRegisteredAttendee) {
+      console.log(`[CLUSTERS] User ${req.user.userId} not authorized to view clusters for event ${eventId}`);
       return res.status(403).json({ error: 'Not authorized to view clusters' });
     }
+
+    console.log(`[CLUSTERS] User authorized as ${isOrganizer ? 'organizer' : 'attendee'}`);
 
     // Get registrations with cluster data
     const registrations = await Registration.find({ event: eventId })
       .populate('attendee', 'firstName lastName email interests professionalRole')
       .sort({ cluster: 1 });
 
-    // Group by cluster with safety checks
+    console.log(`[CLUSTERS] Found ${registrations.length} registrations for clustering`);
+
+    if (registrations.length === 0) {
+      return res.json([]);
+    }
+
+    // Group by cluster with enhanced safety checks
     const clusterMap = new Map();
+    let processedCount = 0;
+    let skippedCount = 0;
+
     registrations.forEach(reg => {
       if (!reg.attendee) {
-        console.warn(`Registration ${reg._id} has no attendee data`);
+        console.warn(`[CLUSTERS] Registration ${reg._id} has no attendee data`);
+        skippedCount++;
         return;
       }
 
@@ -1114,42 +1119,291 @@ app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => 
         clusterMap.set(cluster, []);
       }
       
+      // Create safe member data
       const memberData = {
         id: reg.attendee._id,
         name: `${reg.attendee.firstName || 'Unknown'} ${reg.attendee.lastName || 'User'}`,
-        email: isOrganizer ? reg.attendee.email : 'hidden', // Hide email for attendees
-        interests: reg.attendee.interests || [],
+        email: isOrganizer ? (reg.attendee.email || 'No email') : 'hidden',
+        interests: Array.isArray(reg.attendee.interests) ? reg.attendee.interests : [],
         professionalRole: reg.attendee.professionalRole || 'Not specified',
-        checkedIn: reg.checkedIn
+        checkedIn: Boolean(reg.checkedIn),
+        checkInTime: reg.checkInTime || null
       };
       
       clusterMap.get(cluster).push(memberData);
+      processedCount++;
     });
 
-    const clusters = Array.from(clusterMap.entries()).map(([name, members]) => ({
-      name,
-      members,
-      size: members.length,
-      characteristics: {
-        dominantRole: getMostCommon(members.map(m => m.professionalRole)),
-        commonInterests: getMostCommonItems(members.flatMap(m => m.interests), 3),
-        checkedInCount: members.filter(m => m.checkedIn).length
-      }
-    }));
+    console.log(`[CLUSTERS] Processed ${processedCount} registrations, skipped ${skippedCount}`);
 
-    console.log(`Retrieved ${clusters.length} clusters for event ${event.title}`);
+    // Convert to array format with enhanced cluster info
+    const clusters = Array.from(clusterMap.entries()).map(([name, members]) => {
+      const roles = members.map(m => m.professionalRole);
+      const interests = members.flatMap(m => m.interests);
+      const checkedInMembers = members.filter(m => m.checkedIn);
+
+      return {
+        name,
+        members,
+        size: members.length,
+        characteristics: {
+          dominantRole: getMostCommon(roles),
+          commonInterests: getMostCommonItems(interests, 3),
+          checkedInCount: checkedInMembers.length,
+          checkedInPercentage: members.length > 0 ? Math.round((checkedInMembers.length / members.length) * 100) : 0,
+          diversity: calculateDiversity(roles)
+        }
+      };
+    });
+
+    // Sort clusters by name to ensure consistent ordering
+    clusters.sort((a, b) => a.name.localeCompare(b.name));
+
+    console.log(`[CLUSTERS] Returning ${clusters.length} clusters with sizes:`, clusters.map(c => `${c.name}:${c.size}`));
 
     res.json(clusters);
+
   } catch (error) {
-    console.error('Get clusters error:', error);
+    console.error('[CLUSTERS] Error fetching clusters:', error);
     res.status(500).json({ 
       error: 'Failed to fetch clusters',
-      details: error.message 
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
 
-console.log('Enhanced clustering routes loaded successfully');
+// Smart clustering function with role-based grouping
+function performSmartClustering(attendeeData, targetClusters) {
+  console.log(`[SMART_CLUSTERING] Starting with ${attendeeData.length} attendees, target: ${targetClusters} clusters`);
+  
+  try {
+    // Step 1: Group by normalized professional role
+    const roleGroups = new Map();
+    const unknownGroup = [];
+    
+    attendeeData.forEach(attendee => {
+      const role = attendee.professionalRole && attendee.professionalRole !== 'unknown' 
+        ? normalizeRole(attendee.professionalRole.toLowerCase().trim())
+        : null;
+      
+      if (role && role !== 'unknown' && role !== 'other') {
+        if (!roleGroups.has(role)) {
+          roleGroups.set(role, []);
+        }
+        roleGroups.get(role).push(attendee.id);
+      } else {
+        unknownGroup.push(attendee.id);
+      }
+    });
+
+    console.log(`[SMART_CLUSTERING] Role groups:`, Array.from(roleGroups.entries()).map(([role, members]) => `${role}:${members.length}`));
+    console.log(`[SMART_CLUSTERING] Unknown group size: ${unknownGroup.length}`);
+
+    // Step 2: Convert to clusters array
+    let clusters = Array.from(roleGroups.values());
+    
+    // Add unknown group if not empty
+    if (unknownGroup.length > 0) {
+      clusters.push(unknownGroup);
+    }
+
+    // Step 3: Balance clusters to target number
+    clusters = balanceClusters(clusters, targetClusters);
+
+    console.log(`[SMART_CLUSTERING] Final cluster sizes:`, clusters.map(c => c.length));
+    
+    return clusters;
+
+  } catch (error) {
+    console.error('[SMART_CLUSTERING] Error, falling back to simple clustering:', error);
+    return simpleEvenClustering(attendeeData, targetClusters);
+  }
+}
+
+// Normalize professional roles to standard categories
+function normalizeRole(role) {
+  const roleMapping = {
+    // Engineering roles
+    'software engineer': 'engineer',
+    'software developer': 'engineer',
+    'web developer': 'engineer',
+    'mobile developer': 'engineer',
+    'frontend developer': 'engineer',
+    'backend developer': 'engineer',
+    'full stack developer': 'engineer',
+    'fullstack developer': 'engineer',
+    'devops engineer': 'engineer',
+    'system engineer': 'engineer',
+    'developer': 'engineer',
+    'programmer': 'engineer',
+    
+    // Data roles
+    'data scientist': 'data_professional',
+    'data analyst': 'data_professional',
+    'machine learning engineer': 'data_professional',
+    'ml engineer': 'data_professional',
+    'data engineer': 'data_professional',
+    
+    // Research roles
+    'ai researcher': 'researcher',
+    'researcher': 'researcher',
+    'research scientist': 'researcher',
+    
+    // Design roles
+    'ux designer': 'designer',
+    'ui designer': 'designer',
+    'graphic designer': 'designer',
+    'product designer': 'designer',
+    'web designer': 'designer',
+    'designer': 'designer',
+    
+    // Management roles
+    'product manager': 'manager',
+    'project manager': 'manager',
+    'engineering manager': 'manager',
+    'marketing manager': 'manager',
+    'sales manager': 'manager',
+    'team lead': 'manager',
+    'tech lead': 'manager',
+    'manager': 'manager',
+    
+    // Executive roles
+    'ceo': 'executive',
+    'cto': 'executive',
+    'cfo': 'executive',
+    'vp': 'executive',
+    'director': 'executive',
+    
+    // Entrepreneur roles
+    'founder': 'entrepreneur',
+    'startup founder': 'entrepreneur',
+    'entrepreneur': 'entrepreneur',
+    
+    // Analyst roles
+    'business analyst': 'analyst',
+    'financial analyst': 'analyst',
+    'security analyst': 'analyst',
+    'systems analyst': 'analyst',
+    'analyst': 'analyst',
+    
+    // Other roles
+    'consultant': 'consultant',
+    'student': 'student',
+    'professor': 'academic',
+    'teacher': 'academic',
+    'intern': 'student'
+  };
+  
+  const cleanRole = role.toLowerCase().trim();
+  
+  // Direct match
+  if (roleMapping[cleanRole]) {
+    return roleMapping[cleanRole];
+  }
+  
+  // Partial matches for compound roles
+  for (const [key, value] of Object.entries(roleMapping)) {
+    if (cleanRole.includes(key) || key.includes(cleanRole)) {
+      return value;
+    }
+  }
+  
+  return 'other';
+}
+
+// Balance clusters to target number
+function balanceClusters(clusters, targetClusters) {
+  console.log(`[BALANCE] Input: ${clusters.length} clusters, target: ${targetClusters}`);
+  
+  // Remove empty clusters
+  clusters = clusters.filter(c => c.length > 0);
+  
+  // If we have too many clusters, merge smaller ones
+  if (clusters.length > targetClusters) {
+    clusters.sort((a, b) => b.length - a.length); // Sort by size descending
+    
+    const mainClusters = clusters.slice(0, targetClusters - 1);
+    const clustersToMerge = clusters.slice(targetClusters - 1);
+    const mergedCluster = clustersToMerge.flat();
+    
+    if (mergedCluster.length > 0) {
+      mainClusters.push(mergedCluster);
+    }
+    
+    clusters = mainClusters;
+  }
+
+  // If we have too few clusters, split the largest ones
+  while (clusters.length < targetClusters && clusters.some(c => c.length > 1)) {
+    const largestIndex = clusters.findIndex(c => c.length === Math.max(...clusters.map(cl => cl.length)));
+    const largestCluster = clusters[largestIndex];
+    
+    if (largestCluster.length > 1) {
+      const splitPoint = Math.ceil(largestCluster.length / 2);
+      const cluster1 = largestCluster.slice(0, splitPoint);
+      const cluster2 = largestCluster.slice(splitPoint);
+      
+      clusters[largestIndex] = cluster1;
+      clusters.push(cluster2);
+    } else {
+      break; // Can't split further
+    }
+  }
+
+  console.log(`[BALANCE] Output: ${clusters.length} clusters with sizes:`, clusters.map(c => c.length));
+  return clusters;
+}
+
+// Simple even clustering as fallback
+function simpleEvenClustering(attendeeData, targetClusters) {
+  console.log(`[SIMPLE_CLUSTERING] Creating ${targetClusters} even clusters for ${attendeeData.length} attendees`);
+  
+  const clusters = Array.from({ length: targetClusters }, () => []);
+  
+  attendeeData.forEach((attendee, index) => {
+    const clusterIndex = index % targetClusters;
+    clusters[clusterIndex].push(attendee.id);
+  });
+  
+  return clusters.filter(c => c.length > 0);
+}
+
+// Helper functions
+function getMostCommon(array) {
+  if (array.length === 0) return 'unknown';
+  
+  const counts = {};
+  array.forEach(item => {
+    counts[item] = (counts[item] || 0) + 1;
+  });
+  
+  return Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
+}
+
+function getMostCommonItems(array, limit = 3) {
+  if (array.length === 0) return [];
+  
+  const counts = {};
+  array.forEach(item => {
+    if (item && item.trim()) { // Filter out empty interests
+      counts[item] = (counts[item] || 0) + 1;
+    }
+  });
+  
+  return Object.keys(counts)
+    .sort((a, b) => counts[b] - counts[a])
+    .slice(0, limit);
+}
+
+function calculateDiversity(roles) {
+  if (roles.length <= 1) return 0;
+  
+  const uniqueRoles = new Set(roles.filter(r => r && r !== 'unknown'));
+  return Math.round((uniqueRoles.size / roles.length) * 100) / 100;
+}
+
+console.log('✅ Enhanced clustering routes with comprehensive error handling loaded successfully');
 
 // Analytics routes
 app.get('/api/events/:eventId/analytics', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
