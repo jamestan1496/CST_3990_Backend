@@ -928,15 +928,11 @@ app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['orga
     const eventId = req.params.eventId;
     const { algorithm = 'kmeans', numClusters = 3 } = req.body;
 
-    console.log(`Starting clustering for event ${eventId}`);
+    console.log(`Starting AI clustering for event ${eventId}`);
 
     // Verify organizer owns the event
     const event = await Event.findById(eventId);
-    if (!event) {
-      return res.status(404).json({ error: 'Event not found' });
-    }
-
-    if (event.organizer.toString() !== req.user.userId) {
+    if (!event || event.organizer.toString() !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
@@ -944,314 +940,143 @@ app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['orga
     const registrations = await Registration.find({ event: eventId })
       .populate('attendee', 'firstName lastName email interests professionalRole');
 
-    console.log(`Found ${registrations.length} registrations`);
-
-    if (registrations.length === 0) {
-      return res.status(400).json({ error: 'No registrations found for clustering' });
-    }
-
     if (registrations.length < 2) {
       return res.status(400).json({ error: 'Need at least 2 attendees for clustering' });
     }
 
-    // Filter out registrations with missing attendee data
-    const validRegistrations = registrations.filter(reg => {
-      if (!reg.attendee) {
-        console.warn(`Registration ${reg._id} has missing attendee data`);
-        return false;
-      }
-      return true;
-    });
+    // Prepare data for AI service
+    const attendeeData = registrations
+      .filter(reg => reg.attendee) // Filter out null attendees
+      .map(reg => ({
+        id: reg.attendee._id.toString(),
+        name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
+        email: reg.attendee.email,
+        interests: reg.attendee.interests || [],
+        professionalRole: reg.attendee.professionalRole || 'unknown'
+      }));
 
-    if (validRegistrations.length < 2) {
-      return res.status(400).json({ error: 'Insufficient valid attendee data for clustering' });
-    }
+    console.log(`Prepared ${attendeeData.length} attendees for AI clustering`);
 
-    // Prepare attendee data
-    const attendeeData = validRegistrations.map(reg => ({
-      id: reg.attendee._id.toString(),
-      name: `${reg.attendee.firstName || 'Unknown'} ${reg.attendee.lastName || 'User'}`,
-      email: reg.attendee.email || '',
-      interests: reg.attendee.interests || [],
-      professionalRole: reg.attendee.professionalRole || 'unknown'
-    }));
+    try {
+      // Call AI clustering service
+      const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
+      
+      console.log(`Calling AI service at: ${CLUSTERING_SERVICE_URL}`);
+      
+      const aiResponse = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster`, {
+        data: attendeeData,
+        algorithm: algorithm,
+        numClusters: numClusters
+      }, {
+        timeout: 30000,
+        headers: { 'Content-Type': 'application/json' }
+      });
 
-    console.log(`Prepared ${attendeeData.length} attendees for clustering`);
+      const { clusters, cluster_info, metrics } = aiResponse.data;
+      
+      console.log(`AI clustering successful: ${clusters.length} clusters`);
 
-    // Perform enhanced fallback clustering
-    const clusters = performEnhancedClustering(attendeeData, numClusters);
-
-    // Update registrations with cluster assignments
-    for (let i = 0; i < clusters.length; i++) {
-      const cluster = clusters[i];
-      for (const attendeeId of cluster) {
-        try {
+      // Update database with cluster assignments
+      for (let i = 0; i < clusters.length; i++) {
+        const cluster = clusters[i];
+        for (const attendeeId of cluster) {
           await Registration.findOneAndUpdate(
             { event: eventId, attendee: attendeeId },
-            { cluster: `cluster_${i}` }
+            { cluster: `ai_cluster_${i}` }
           );
-        } catch (updateError) {
-          console.warn(`Failed to update cluster for attendee ${attendeeId}:`, updateError);
         }
       }
-    }
 
-    // Generate cluster info
-    const clusterInfo = clusters.map((cluster, index) => {
-      const clusterMembers = attendeeData.filter(att => cluster.includes(att.id));
-      const roles = clusterMembers.map(m => m.professionalRole || 'unknown');
-      const interests = clusterMembers.flatMap(m => m.interests || []);
+      res.json({
+        message: 'AI clustering completed successfully',
+        clusters,
+        cluster_info,
+        metrics: {
+          ...metrics,
+          service: 'AI Clustering Service',
+          algorithm_used: algorithm
+        },
+        totalAttendees: attendeeData.length
+      });
+
+    } catch (aiError) {
+      console.error('AI service failed:', aiError.message);
       
-      const mostCommonRole = getMostCommon(roles);
-      const topInterests = getMostCommonItems(interests, 3);
+      // Fallback clustering
+      console.log('Using fallback clustering...');
       
-      return {
-        name: `cluster_${index}`,
-        size: cluster.length,
-        members: clusterMembers.map(m => ({
-          id: m.id,
-          name: m.name,
-          email: m.email,
-          professionalRole: m.professionalRole,
-          interests: m.interests
-        })),
-        characteristics: {
-          dominantRole: mostCommonRole,
-          commonInterests: topInterests,
-          diversity: calculateDiversity(clusterMembers)
+      const fallbackClusters = performFallbackClustering(attendeeData, numClusters);
+      
+      // Update database with fallback clusters
+      for (let i = 0; i < fallbackClusters.length; i++) {
+        const cluster = fallbackClusters[i];
+        for (const attendeeId of cluster) {
+          await Registration.findOneAndUpdate(
+            { event: eventId, attendee: attendeeId },
+            { cluster: `fallback_cluster_${i}` }
+          );
         }
-      };
-    });
+      }
 
-    const metrics = {
-      totalAttendees: attendeeData.length,
-      numClusters: clusters.length,
-      avgClusterSize: Math.round(attendeeData.length / clusters.length),
-      algorithm: 'enhanced-fallback',
-      timestamp: new Date().toISOString()
-    };
-
-    console.log(`Clustering completed: ${clusters.length} clusters created`);
-
-    res.json({
-      message: 'Clustering completed successfully',
-      clusters,
-      clusterInfo,
-      metrics,
-      totalAttendees: attendeeData.length
-    });
+      res.json({
+        message: 'Clustering completed using fallback method',
+        clusters: fallbackClusters,
+        metrics: {
+          service: 'Fallback Clustering',
+          totalAttendees: attendeeData.length,
+          note: 'AI service unavailable - used intelligent fallback'
+        },
+        totalAttendees: attendeeData.length
+      });
+    }
 
   } catch (error) {
     console.error('Clustering error:', error);
-    res.status(500).json({ 
-      error: 'Clustering failed', 
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    res.status(500).json({ error: 'Clustering failed', details: error.message });
   }
 });
 
-// Enhanced clustering function
-function performEnhancedClustering(attendeeData, numClusters) {
-  console.log(`Performing enhanced clustering with ${numClusters} target clusters`);
+// Simple fallback clustering function
+function performFallbackClustering(attendeeData, numClusters) {
+  // Group by professional role
+  const roleGroups = new Map();
   
-  try {
-    // Step 1: Group by professional role
-    const roleGroups = new Map();
-    const unknownGroup = [];
-    
-    attendeeData.forEach(attendee => {
-      const role = attendee.professionalRole && attendee.professionalRole !== 'unknown' 
-        ? normalizeRole(attendee.professionalRole.toLowerCase().trim())
-        : null;
-      
-      if (role && role !== 'unknown') {
-        if (!roleGroups.has(role)) {
-          roleGroups.set(role, []);
-        }
-        roleGroups.get(role).push(attendee.id);
-      } else {
-        unknownGroup.push(attendee.id);
-      }
-    });
-
-    console.log(`Role groups created: ${roleGroups.size}, Unknown: ${unknownGroup.length}`);
-
-    // Step 2: Convert to array
-    let clusters = Array.from(roleGroups.values());
-    
-    // Add unknown group if not empty
-    if (unknownGroup.length > 0) {
-      clusters.push(unknownGroup);
+  attendeeData.forEach(attendee => {
+    const role = attendee.professionalRole || 'unknown';
+    if (!roleGroups.has(role)) {
+      roleGroups.set(role, []);
     }
+    roleGroups.get(role).push(attendee.id);
+  });
 
-    // Step 3: Balance clusters to target number
-    clusters = balanceClusters(clusters, numClusters, attendeeData);
-
-    console.log(`Final clusters: ${clusters.map(c => c.length).join(', ')}`);
-    
-    return clusters;
-
-  } catch (error) {
-    console.error('Enhanced clustering failed:', error);
-    // Fallback to simple random clustering
-    return simpleRandomClustering(attendeeData, numClusters);
-  }
-}
-
-// Normalize professional roles
-function normalizeRole(role) {
-  const roleMapping = {
-    'software engineer': 'engineer',
-    'software developer': 'engineer',
-    'web developer': 'engineer',
-    'mobile developer': 'engineer',
-    'frontend developer': 'engineer',
-    'backend developer': 'engineer',
-    'full stack developer': 'engineer',
-    'fullstack developer': 'engineer',
-    'devops engineer': 'engineer',
-    'data scientist': 'data_professional',
-    'data analyst': 'data_professional',
-    'machine learning engineer': 'data_professional',
-    'ai researcher': 'researcher',
-    'researcher': 'researcher',
-    'ux designer': 'designer',
-    'ui designer': 'designer',
-    'graphic designer': 'designer',
-    'product designer': 'designer',
-    'product manager': 'manager',
-    'project manager': 'manager',
-    'engineering manager': 'manager',
-    'marketing manager': 'manager',
-    'sales manager': 'manager',
-    'ceo': 'executive',
-    'cto': 'executive',
-    'cfo': 'executive',
-    'founder': 'entrepreneur',
-    'startup founder': 'entrepreneur',
-    'business analyst': 'analyst',
-    'financial analyst': 'analyst',
-    'security analyst': 'analyst',
-    'consultant': 'consultant',
-    'student': 'student',
-    'professor': 'academic',
-    'teacher': 'academic',
-    'developer': 'engineer',
-    'designer': 'designer',
-    'manager': 'manager',
-    'analyst': 'analyst',
-    'engineer': 'engineer'
-  };
+  let clusters = Array.from(roleGroups.values());
   
-  // Clean the role string
-  const cleanRole = role.toLowerCase().trim();
-  
-  // Direct match
-  if (roleMapping[cleanRole]) {
-    return roleMapping[cleanRole];
-  }
-  
-  // Partial matches
-  for (const [key, value] of Object.entries(roleMapping)) {
-    if (cleanRole.includes(key.split(' ')[0])) { // Match first word
-      return value;
-    }
-  }
-  
-  return 'other';
-}
-
-// Balance clusters to target number
-function balanceClusters(clusters, targetClusters, attendeeData) {
-  // If we have too many clusters, merge smaller ones
-  if (clusters.length > targetClusters) {
-    clusters.sort((a, b) => b.length - a.length); // Sort by size descending
-    
-    const mainClusters = clusters.slice(0, targetClusters - 1);
-    const mergeClusters = clusters.slice(targetClusters - 1);
-    const mergedCluster = mergeClusters.flat();
-    
-    if (mergedCluster.length > 0) {
-      mainClusters.push(mergedCluster);
-    }
-    
+  // Balance to target number of clusters
+  if (clusters.length > numClusters) {
+    clusters.sort((a, b) => b.length - a.length);
+    const mainClusters = clusters.slice(0, numClusters - 1);
+    const merged = clusters.slice(numClusters - 1).flat();
+    if (merged.length > 0) mainClusters.push(merged);
     clusters = mainClusters;
   }
-
-  // If we have too few clusters, split the largest ones
-  while (clusters.length < targetClusters && clusters.some(c => c.length > 1)) {
-    const largestIndex = clusters.findIndex(c => c.length === Math.max(...clusters.map(cl => cl.length)));
-    const largestCluster = clusters[largestIndex];
-    
-    if (largestCluster.length > 1) {
-      const splitPoint = Math.ceil(largestCluster.length / 2);
-      const cluster1 = largestCluster.slice(0, splitPoint);
-      const cluster2 = largestCluster.slice(splitPoint);
-      
-      clusters[largestIndex] = cluster1;
-      clusters.push(cluster2);
-    } else {
-      break;
-    }
-  }
-
-  // Remove empty clusters
-  clusters = clusters.filter(c => c.length > 0);
-
+  
   return clusters;
 }
 
-// Simple random clustering as ultimate fallback
-function simpleRandomClustering(attendeeData, numClusters) {
-  console.log('Using simple random clustering fallback');
-  
-  const clusters = Array.from({ length: numClusters }, () => []);
-  
-  attendeeData.forEach((attendee, index) => {
-    const clusterIndex = index % numClusters;
-    clusters[clusterIndex].push(attendee.id);
-  });
-  
-  return clusters.filter(c => c.length > 0);
-}
+// Health check for AI service
+app.get('/api/clustering/health', authenticateToken, async (req, res) => {
+  try {
+    const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL;
+    if (!CLUSTERING_SERVICE_URL) {
+      return res.json({ status: 'not_configured', message: 'Clustering service URL not set' });
+    }
 
-// Helper function to get most common item
-function getMostCommon(array) {
-  if (array.length === 0) return 'unknown';
-  
-  const counts = {};
-  array.forEach(item => {
-    counts[item] = (counts[item] || 0) + 1;
-  });
-  
-  return Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
-}
-
-// Helper function to get most common items
-function getMostCommonItems(array, limit = 3) {
-  if (array.length === 0) return [];
-  
-  const counts = {};
-  array.forEach(item => {
-    counts[item] = (counts[item] || 0) + 1;
-  });
-  
-  return Object.keys(counts)
-    .sort((a, b) => counts[b] - counts[a])
-    .slice(0, limit);
-}
-
-// Calculate diversity score for a cluster
-function calculateDiversity(clusterMembers) {
-  if (clusterMembers.length <= 1) return 0;
-  
-  const roles = clusterMembers.map(m => m.professionalRole || 'unknown');
-  const uniqueRoles = new Set(roles);
-  
-  return Math.round((uniqueRoles.size / clusterMembers.length) * 100) / 100;
-}
-
+    const response = await axios.get(`${CLUSTERING_SERVICE_URL}/health`, { timeout: 5000 });
+    res.json({ status: 'healthy', ai_service: response.data });
+  } catch (error) {
+    res.json({ status: 'unavailable', error: error.message, fallback: 'available' });
+  }
+});
 // Enhanced clusters GET route
 app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => {
   try {
