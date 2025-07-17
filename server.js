@@ -478,6 +478,53 @@ app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), uplo
     });
   }
 });
+app.delete('/api/events/:id', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
+  try {
+    const eventId = req.params.id;
+
+    // Validate event ID
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ error: 'Invalid event ID' });
+    }
+
+    // Find event
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    // Check authorization
+    if (event.organizer.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Not authorized to delete this event' });
+    }
+
+    // Check if event has registrations
+    const registrationCount = await Registration.countDocuments({ event: eventId });
+    if (registrationCount > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete event with ${registrationCount} registered attendees. Please contact attendees first.` 
+      });
+    }
+
+    // Delete the event
+    await Event.findByIdAndDelete(eventId);
+
+    // Also delete any remaining registrations (cleanup)
+    await Registration.deleteMany({ event: eventId });
+
+    // Delete any session tracking records
+    await SessionTracking.deleteMany({ event: eventId });
+
+    res.json({
+      message: 'Event deleted successfully',
+      eventId: eventId
+    });
+
+  } catch (error) {
+    console.error('Delete event error:', error);
+    res.status(500).json({ error: 'Failed to delete event' });
+  }
+});
 
 // Registration routes
 app.post('/api/events/:eventId/register', authenticateToken, async (req, res) => {
