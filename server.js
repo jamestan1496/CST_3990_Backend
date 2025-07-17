@@ -9,6 +9,12 @@ const http = require('http');
 const axios = require('axios');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  console.log('Created uploads directory');
+}
 
 // Initialize Express app
 const app = express();
@@ -24,7 +30,7 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static('uploads'));
+app.use('/uploads', express.static(uploadsDir));
 
 // Configuration
 const PORT = process.env.PORT || 5000;
@@ -564,6 +570,44 @@ app.get('/api/events/:eventId/registrations', authenticateToken, async (req, res
     res.status(500).json({ error: 'Failed to fetch registrations' });
   }
 });
+app.get('/api/events', async (req, res) => {
+  try {
+    console.log('=== GET ALL EVENTS ===');
+    console.log('Query params:', req.query);
+
+    const { search, status, limit = 50 } = req.query;
+    let query = {};
+
+    // Build search query
+    if (search && search.trim()) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    if (status && status.trim()) {
+      query.status = status;
+    }
+
+    console.log('MongoDB query:', query);
+
+    const events = await Event.find(query)
+      .populate('organizer', 'firstName lastName email')
+      .sort({ date: 1 })
+      .limit(parseInt(limit));
+
+    console.log(`Found ${events.length} events`);
+    res.json(events);
+
+  } catch (error) {
+    console.error('Get events error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch events',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
+  }
+});
 
 // Check-in routes
 app.post('/api/checkin', authenticateToken, async (req, res) => {
@@ -934,46 +978,81 @@ app.post('/api/events/:eventId/sessions/:sessionId/leave', authenticateToken, as
 // User profile routes
 app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
+    console.log('=== GET PROFILE ===');
+    console.log('User ID:', req.user.userId);
+
     const user = await User.findById(req.user.userId).select('-password');
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    console.log('Profile loaded for:', user.email);
     res.json(user);
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({ error: 'Failed to fetch profile' });
+    res.status(500).json({ 
+      error: 'Failed to fetch profile',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 
 app.put('/api/profile', authenticateToken, async (req, res) => {
   try {
+    console.log('=== UPDATE PROFILE ===');
+    console.log('User ID:', req.user.userId);
+    console.log('Update data:', req.body);
+
     const { firstName, lastName, interests, professionalRole } = req.body;
     
     const updatedUser = await User.findByIdAndUpdate(
       req.user.userId,
       { firstName, lastName, interests, professionalRole },
-      { new: true }
+      { new: true, runValidators: true }
     ).select('-password');
 
+    if (!updatedUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    console.log('Profile updated for:', updatedUser.email);
     res.json({
       message: 'Profile updated successfully',
       user: updatedUser
     });
   } catch (error) {
     console.error('Update profile error:', error);
-    res.status(500).json({ error: 'Failed to update profile' });
+    res.status(500).json({ 
+      error: 'Failed to update profile',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 
 // My events route
 app.get('/api/my-events', authenticateToken, async (req, res) => {
   try {
+    console.log('=== GET MY EVENTS ===');
+    console.log('User:', req.user);
+
     if (req.user.role === 'organizer') {
       // Get events created by organizer
       const events = await Event.find({ organizer: req.user.userId })
+        .populate('organizer', 'firstName lastName email')
         .sort({ date: 1 });
+      
+      console.log(`Found ${events.length} events for organizer`);
       res.json(events);
     } else {
       // Get events registered by attendee
       const registrations = await Registration.find({ attendee: req.user.userId })
-        .populate('event')
+        .populate({
+          path: 'event',
+          populate: {
+            path: 'organizer',
+            select: 'firstName lastName email'
+          }
+        })
         .sort({ 'event.date': 1 });
       
       const events = registrations.map(reg => ({
@@ -983,11 +1062,15 @@ app.get('/api/my-events', authenticateToken, async (req, res) => {
         cluster: reg.cluster
       }));
       
+      console.log(`Found ${events.length} registered events for attendee`);
       res.json(events);
     }
   } catch (error) {
     console.error('Get my events error:', error);
-    res.status(500).json({ error: 'Failed to fetch events' });
+    res.status(500).json({ 
+      error: 'Failed to fetch events',
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+    });
   }
 });
 // Get attendee's own registration for an event (ADD THIS TO YOUR BACKEND)
@@ -1017,9 +1100,48 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || 'development'
   });
 });
+// 6. Add request logging middleware for debugging
+app.use('/api', (req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  console.log('Headers:', req.headers);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log('Body:', req.body);
+  }
+  next();
+});
+app.use('/api/*', (req, res) => {
+  console.log(`404 - Route not found: ${req.method} ${req.originalUrl}`);
+  res.status(404).json({ 
+    error: 'API route not found',
+    method: req.method,
+    path: req.originalUrl,
+    available_routes: [
+      'GET /api/health',
+      'POST /api/auth/login',
+      'POST /api/auth/register',
+      'GET /api/events',
+      'POST /api/events',
+      'GET /api/my-events',
+      'GET /api/profile',
+      'PUT /api/profile'
+    ]
+  });
+});
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:8080',
+    'http://127.0.0.1:5500',
+    'https://jamestan1496.github.io/CST_3990_Frontend/' // Add your actual frontend domain
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
