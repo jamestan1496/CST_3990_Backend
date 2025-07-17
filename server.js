@@ -586,44 +586,81 @@ app.post('/api/events/:eventId/register', authenticateToken, async (req, res) =>
   }
 });
 
-app.get('/api/events/:eventId/registrations', authenticateToken, async (req, res) => {
+app.get('/api/my-events', authenticateToken, async (req, res) => {
   try {
-    const eventId = req.params.eventId;
+    console.log('=== GET MY EVENTS ===');
+    console.log('User:', req.user);
 
-    // Check if user is organizer of the event
-    const event = await Event.findById(eventId);
-    if (!event) {
-      return res.status(404).json({ error: 'Event not found' });
+    if (req.user.role === 'organizer') {
+      // Get events created by organizer
+      const events = await Event.find({ organizer: req.user.userId })
+        .populate('organizer', 'firstName lastName email')
+        .sort({ date: 1 });
+      
+      console.log(`Found ${events.length} events for organizer`);
+      res.json(events);
+    } else {
+      // Get events registered by attendee
+      const registrations = await Registration.find({ attendee: req.user.userId })
+        .populate({
+          path: 'event',
+          populate: {
+            path: 'organizer',
+            select: 'firstName lastName email'
+          }
+        })
+        .sort({ 'event.date': 1 });
+      
+      const events = registrations.map(reg => ({
+        ...reg.event.toObject(),
+        registrationId: reg._id,
+        checkedIn: reg.checkedIn,
+        cluster: reg.cluster
+      }));
+      
+      console.log(`Found ${events.length} registered events for attendee`);
+      res.json(events);
     }
-
-    if (event.organizer.toString() !== req.user.userId && req.user.role !== 'organizer') {
-      return res.status(403).json({ error: 'Not authorized to view registrations' });
-    }
-
-    const registrations = await Registration.find({ event: eventId })
-      .populate('attendee', 'firstName lastName email interests professionalRole')
-      .sort({ registrationDate: -1 });
-
-    res.json(registrations);
   } catch (error) {
-    console.error('Get registrations error:', error);
-    res.status(500).json({ error: 'Failed to fetch registrations' });
+    console.error('Get my events error:', error);
+    res.status(500).json({ error: 'Failed to fetch events' });
   }
 });
 app.get('/api/events', async (req, res) => {
   try {
-    const { search, status } = req.query;
+    console.log('=== GET ALL EVENTS ===');
+    console.log('Query params:', req.query);
+
+    const { search, status, limit = 50 } = req.query;
     let query = {};
-    if (search) query.$or = [{ title: { $regex: search, $options: 'i' } }, { description: { $regex: search, $options: 'i' } }];
-    if (status) query.status = status;
-    const events = await Event.find(query).populate('organizer', 'firstName lastName email').sort({ date: 1 });
+
+    if (search && search.trim()) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { location: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    if (status && status.trim()) {
+      query.status = status;
+    }
+
+    console.log('MongoDB query:', query);
+
+    const events = await Event.find(query)
+      .populate('organizer', 'firstName lastName email')
+      .sort({ date: 1 })
+      .limit(parseInt(limit));
+
+    console.log(`Found ${events.length} events`);
     res.json(events);
+
   } catch (error) {
+    console.error('Get events error:', error);
     res.status(500).json({ error: 'Failed to fetch events' });
   }
-
-  }
-);
+});
 
 // Check-in routes
 app.post('/api/checkin', authenticateToken, async (req, res) => {
@@ -1006,10 +1043,7 @@ app.get('/api/profile', authenticateToken, async (req, res) => {
     res.json(user);
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch profile',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    res.status(500).json({ error: 'Failed to fetch profile' });
   }
 });
 
@@ -1038,13 +1072,9 @@ app.put('/api/profile', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Update profile error:', error);
-    res.status(500).json({ 
-      error: 'Failed to update profile',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    res.status(500).json({ error: 'Failed to update profile' });
   }
 });
-
 // My events route
 app.get('/api/my-events', authenticateToken, async (req, res) => {
   try {
