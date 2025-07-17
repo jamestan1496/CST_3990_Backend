@@ -196,100 +196,45 @@ io.on('connection', (socket) => {
 // Authentication routes
 app.post('/api/auth/register', async (req, res) => {
   try {
-    console.log('=== REGISTER REQUEST ===');
-    console.log('Request body:', req.body);
-    
     const { username, email, password, firstName, lastName, role, interests, professionalRole } = req.body;
-
-    // Check if user already exists
     const existingUser = await User.findOne({ $or: [{ email }, { username }] });
     if (existingUser) {
       return res.status(400).json({ error: 'User already exists' });
     }
-
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Create new user
     const user = new User({
-      username,
-      email,
-      password: hashedPassword,
-      firstName,
-      lastName,
-      role: role || 'attendee',
-      interests: interests || [],
-      professionalRole
+      username, email, password: hashedPassword, firstName, lastName,
+      role: role || 'attendee', interests: interests || [], professionalRole
     });
-
     await user.save();
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log('User registered successfully:', user.email);
+    const token = jwt.sign({ userId: user._id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
     res.status(201).json({
       message: 'User registered successfully',
       token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        firstName: user.firstName,
-        lastName: user.lastName
-      }
+      user: { id: user._id, username: user.username, email: user.email, role: user.role, firstName: user.firstName, lastName: user.lastName }
     });
   } catch (error) {
-    console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
   }
 });
 app.post('/api/auth/login', async (req, res) => {
   try {
-    console.log('=== LOGIN REQUEST ===');
-    console.log('Request body:', req.body);
-    
     const { email, password } = req.body;
-
-    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-
-    // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log('User logged in successfully:', user.email);
+    const token = jwt.sign({ userId: user._id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
     res.json({
       message: 'Login successful',
       token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        firstName: user.firstName,
-        lastName: user.lastName
-      }
+      user: { id: user._id, username: user.username, email: user.email, role: user.role, firstName: user.firstName, lastName: user.lastName }
     });
   } catch (error) {
-    console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -620,42 +565,18 @@ app.get('/api/events/:eventId/registrations', authenticateToken, async (req, res
 });
 app.get('/api/events', async (req, res) => {
   try {
-    console.log('=== GET ALL EVENTS ===');
-    console.log('Query params:', req.query);
-
-    const { search, status, limit = 50 } = req.query;
+    const { search, status } = req.query;
     let query = {};
-
-    // Build search query
-    if (search && search.trim()) {
-      query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    if (status && status.trim()) {
-      query.status = status;
-    }
-
-    console.log('MongoDB query:', query);
-
-    const events = await Event.find(query)
-      .populate('organizer', 'firstName lastName email')
-      .sort({ date: 1 })
-      .limit(parseInt(limit));
-
-    console.log(`Found ${events.length} events`);
+    if (search) query.$or = [{ title: { $regex: search, $options: 'i' } }, { description: { $regex: search, $options: 'i' } }];
+    if (status) query.status = status;
+    const events = await Event.find(query).populate('organizer', 'firstName lastName email').sort({ date: 1 });
     res.json(events);
-
   } catch (error) {
-    console.error('Get events error:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch events',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    res.status(500).json({ error: 'Failed to fetch events' });
   }
-});
+
+  }
+);
 
 // Check-in routes
 app.post('/api/checkin', authenticateToken, async (req, res) => {
