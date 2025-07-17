@@ -196,6 +196,9 @@ io.on('connection', (socket) => {
 // Authentication routes
 app.post('/api/auth/register', async (req, res) => {
   try {
+    console.log('=== REGISTER REQUEST ===');
+    console.log('Request body:', req.body);
+    
     const { username, email, password, firstName, lastName, role, interests, professionalRole } = req.body;
 
     // Check if user already exists
@@ -228,6 +231,7 @@ app.post('/api/auth/register', async (req, res) => {
       { expiresIn: '24h' }
     );
 
+    console.log('User registered successfully:', user.email);
     res.status(201).json({
       message: 'User registered successfully',
       token,
@@ -243,6 +247,50 @@ app.post('/api/auth/register', async (req, res) => {
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
+  }
+});
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    console.log('=== LOGIN REQUEST ===');
+    console.log('Request body:', req.body);
+    
+    const { email, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    console.log('User logged in successfully:', user.email);
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
