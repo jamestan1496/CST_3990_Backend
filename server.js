@@ -10,11 +10,6 @@ const axios = require('axios');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-  console.log('Created uploads directory');
-}
 
 // Initialize Express app
 const app = express();
@@ -30,24 +25,73 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static(uploadsDir));
+// Enhanced static file serving with better error handling
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+    // Add proper headers for images
+    setHeaders: (res, path, stat) => {
+        res.set({
+            'Cache-Control': 'public, max-age=86400', // Cache for 1 day
+            'Cross-Origin-Resource-Policy': 'cross-origin'
+        });
+    },
+    // Handle missing files gracefully
+    fallthrough: false
+}));
+app.use('/uploads', (req, res, next) => {
+    res.status(404).json({ 
+        error: 'Image not found',
+        path: req.path,
+        suggestion: 'The image may have been deleted or the filename is incorrect'
+    });
+});
 
 // Configuration
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://jamestan1496:eventhive@cluster0.gf6vat2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-here';
-const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'http://localhost:5001';
+const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL || 'https://cst-3990-pythonclustering.onrender.com';
 
+// Create uploads directory if it doesn't exist (add this after your middleware setup)
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    console.log('Created uploads directory:', uploadsDir);
+}
 // File upload configuration
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, 'uploads/');
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
-  }
+    destination: function (req, file, cb) {
+        const uploadsPath = path.join(__dirname, 'uploads');
+        // Ensure directory exists
+        if (!fs.existsSync(uploadsPath)) {
+            fs.mkdirSync(uploadsPath, { recursive: true });
+        }
+        cb(null, uploadsPath);
+    },
+    filename: function (req, file, cb) {
+        // Create unique filename with original extension
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const extension = path.extname(file.originalname);
+        const filename = uniqueSuffix + extension;
+        
+        console.log('Storing file as:', filename);
+        cb(null, filename);
+    }
 });
-const upload = multer({ storage: storage });
+const upload = multer({ 
+    storage: storage,
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        // Check file type
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.'));
+        }
+    }
+});
 
 // MongoDB connection
 mongoose.connect(MONGODB_URI, {
@@ -197,210 +241,241 @@ io.on('connection', (socket) => {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password, firstName, lastName, role, interests, professionalRole } = req.body;
+
+    // Check if user already exists
     const existingUser = await User.findOne({ $or: [{ email }, { username }] });
     if (existingUser) {
       return res.status(400).json({ error: 'User already exists' });
     }
+
+    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Create new user
     const user = new User({
-      username, email, password: hashedPassword, firstName, lastName,
-      role: role || 'attendee', interests: interests || [], professionalRole
+      username,
+      email,
+      password: hashedPassword,
+      firstName,
+      lastName,
+      role: role || 'attendee',
+      interests: interests || [],
+      professionalRole
     });
+
     await user.save();
-    const token = jwt.sign({ userId: user._id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
     res.status(201).json({
       message: 'User registered successfully',
       token,
-      user: { id: user._id, username: user.username, email: user.email, role: user.role, firstName: user.firstName, lastName: user.lastName }
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName
+      }
     });
   } catch (error) {
+    console.error('Registration error:', error);
     res.status(500).json({ error: 'Registration failed' });
   }
 });
+
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
+    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    const token = jwt.sign({ userId: user._id, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
     res.json({
       message: 'Login successful',
       token,
-      user: { id: user._id, username: user.username, email: user.email, role: user.role, firstName: user.firstName, lastName: user.lastName }
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName
+      }
     });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 });
 
+// Event routes
+// Replace your existing event creation route with this:
+// Get all events (for attendees to browse and register)
+app.get('/api/events', async (req, res) => {
+  try {
+    const { search, status, limit = 50, page = 1 } = req.query;
+    
+    // Build filter object
+    const filter = {};
+    
+    // Add search filter
+    if (search && search.trim()) {
+      filter.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { location: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    // Add status filter
+    if (status) {
+      filter.status = status;
+    }
+    
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    // Get events with organizer info
+    const events = await Event.find(filter)
+      .populate('organizer', 'firstName lastName email')
+      .sort({ date: 1 }) // Sort by date ascending
+      .skip(skip)
+      .limit(parseInt(limit));
+    
+    // Get total count for pagination
+    const total = await Event.countDocuments(filter);
+    
+    // Add attendee count to each event
+    const eventsWithCounts = await Promise.all(
+      events.map(async (event) => {
+        const attendeeCount = await Registration.countDocuments({ event: event._id });
+        const eventObj = event.toObject();
+        return {
+          ...eventObj,
+          attendeeCount,
+          spotsRemaining: event.maxAttendees - attendeeCount
+        };
+      })
+    );
+    
+    res.json({
+      events: eventsWithCounts,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('Get events error:', error);
+    res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
 app.post('/api/events', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
-    console.log('=== CREATE EVENT REQUEST ===');
-    console.log('Request body:', req.body);
-    console.log('Request file:', req.file);
-    console.log('Request user:', req.user);
-    
     const { title, description, date, time, location, maxAttendees, sessions } = req.body;
 
-    // Comprehensive validation
-    if (!title || !description || !date || !time || !location) {
-      console.log('Missing required fields:', { title: !!title, description: !!description, date: !!date, time: !!time, location: !!location });
-      return res.status(400).json({ 
-        error: 'Missing required fields',
-        required: ['title', 'description', 'date', 'time', 'location'],
-        received: { title: !!title, description: !!description, date: !!date, time: !!time, location: !!location }
-      });
-    }
-
-    // Validate date
-    const eventDate = new Date(date);
-    if (isNaN(eventDate.getTime())) {
-      console.log('Invalid date format:', date);
-      return res.status(400).json({ error: 'Invalid date format' });
-    }
-
-    // Validate time format
-    if (!/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(time)) {
-      console.log('Invalid time format:', time);
-      return res.status(400).json({ error: 'Invalid time format. Use HH:MM format' });
-    }
+    console.log('Creating event with date:', date, 'time:', time); // Debug log
 
     // Validate that the event date is not in the past
+    const eventDate = new Date(date);
     const currentDate = new Date();
+    
+    console.log('Event date:', eventDate); // Debug log
+    console.log('Current date:', currentDate); // Debug log
+    
+    // Set current date to start of day for comparison
     currentDate.setHours(0, 0, 0, 0);
     eventDate.setHours(0, 0, 0, 0);
     
     if (eventDate < currentDate) {
-      console.log('Event date is in the past:', { eventDate, currentDate });
+      console.log('Date validation failed: Event date is in the past'); // Debug log
       return res.status(400).json({ 
         error: 'Cannot create event for a past date. Please select a current or future date.' 
       });
     }
 
-    // Parse sessions safely
-    let parsedSessions = [];
-    if (sessions) {
-      try {
-        parsedSessions = JSON.parse(sessions);
-        console.log('Parsed sessions:', parsedSessions);
-      } catch (sessionParseError) {
-        console.log('Failed to parse sessions:', sessionParseError);
-        return res.status(400).json({ error: 'Invalid sessions format' });
+    // Additional validation for time if event is today
+    if (eventDate.getTime() === currentDate.getTime() && time) {
+      const currentTime = new Date();
+      const [hours, minutes] = time.split(':');
+      const eventDateTime = new Date();
+      eventDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+      
+      console.log('Time validation - Event time:', eventDateTime, 'Current time:', currentTime); // Debug log
+      
+      if (eventDateTime < currentTime) {
+        console.log('Time validation failed: Event time is in the past'); // Debug log
+        return res.status(400).json({ 
+          error: 'Cannot create event for a past time today. Please select a future time.' 
+        });
       }
     }
 
-    // Validate maxAttendees
-    const maxAttendeesNum = maxAttendees ? parseInt(maxAttendees) : 100;
-    if (isNaN(maxAttendeesNum) || maxAttendeesNum < 1) {
-      return res.status(400).json({ error: 'Invalid maxAttendees value' });
-    }
+    console.log('Date validation passed, creating event...'); // Debug log
 
-    console.log('Creating event with data:', {
+    const event = new Event({
       title,
       description,
-      date: eventDate,
+      date: new Date(date),
       time,
       location,
       organizer: req.user.userId,
-      maxAttendees: maxAttendeesNum,
+      maxAttendees: maxAttendees || 100,
       image: req.file ? req.file.filename : null,
-      sessions: parsedSessions
+      sessions: sessions ? JSON.parse(sessions) : []
     });
 
-    const event = new Event({
-      title: title.trim(),
-      description: description.trim(),
-      date: eventDate,
-      time,
-      location: location.trim(),
-      organizer: req.user.userId,
-      maxAttendees: maxAttendeesNum,
-      image: req.file ? req.file.filename : null,
-      sessions: parsedSessions
-    });
-
-    console.log('Saving event to database...');
     await event.save();
-    console.log('Event saved successfully:', event._id);
-
-    console.log('Populating organizer data...');
     await event.populate('organizer', 'firstName lastName email');
 
-    console.log('=== CREATE EVENT SUCCESS ===');
+    console.log('Event created successfully:', event._id); // Debug log
+
     res.status(201).json({
       message: 'Event created successfully',
       event
     });
-
   } catch (error) {
-    console.error('=== CREATE EVENT ERROR ===');
-    console.error('Error type:', error.name);
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
-    
-    // Handle specific MongoDB errors
-    if (error.name === 'ValidationError') {
-      const validationErrors = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({ 
-        error: 'Validation failed', 
-        details: validationErrors 
-      });
-    }
-
-    if (error.name === 'MongoError' || error.name === 'MongoServerError') {
-      console.error('MongoDB error:', error);
-      return res.status(500).json({ error: 'Database error occurred' });
-    }
-
-    // Generic error response
-    res.status(500).json({ 
-      error: 'Failed to create event',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    console.error('Create event error:', error);
+    res.status(500).json({ error: 'Failed to create event' });
   }
 });
 
-// Event update route with date validation
+// Also replace your event update route:
 app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
-    console.log('=== UPDATE EVENT REQUEST ===');
-    console.log('Event ID:', req.params.id);
-    console.log('Request body:', req.body);
-    console.log('Request file:', req.file);
-    console.log('Request user:', req.user);
-
-    const eventId = req.params.id;
-
-    // Validate event ID format
-    if (!eventId || eventId === 'null' || eventId === 'undefined') {
-      console.log('Invalid event ID:', eventId);
-      return res.status(400).json({ error: 'Valid event ID is required' });
-    }
-
-    // Validate ObjectId format
-    if (!mongoose.Types.ObjectId.isValid(eventId)) {
-      console.log('Invalid ObjectId format:', eventId);
-      return res.status(400).json({ error: 'Invalid event ID format' });
-    }
-
     const { title, description, date, time, location, maxAttendees, sessions, status } = req.body;
 
-    console.log('Finding event...');
-    const event = await Event.findById(eventId);
+    const event = await Event.findById(req.params.id);
     if (!event) {
-      console.log('Event not found:', eventId);
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    console.log('Checking authorization...');
     if (event.organizer.toString() !== req.user.userId) {
-      console.log('Unauthorized update attempt:', { organizer: event.organizer, user: req.user.userId });
       return res.status(403).json({ error: 'Not authorized to update this event' });
     }
 
@@ -409,6 +484,7 @@ app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), uplo
       const eventDate = new Date(date);
       const currentDate = new Date();
       
+      // Set current date to start of day for comparison
       currentDate.setHours(0, 0, 0, 0);
       eventDate.setHours(0, 0, 0, 0);
       
@@ -417,15 +493,29 @@ app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), uplo
           error: 'Cannot update event to a past date. Please select a current or future date.' 
         });
       }
+
+      // Additional validation for time if event is today and time is being updated
+      if (eventDate.getTime() === currentDate.getTime() && time) {
+        const currentTime = new Date();
+        const [hours, minutes] = time.split(':');
+        const eventDateTime = new Date();
+        eventDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+        
+        if (eventDateTime < currentTime) {
+          return res.status(400).json({ 
+            error: 'Cannot update event to a past time today. Please select a future time.' 
+          });
+        }
+      }
     }
 
     const updateData = {
-      title: title ? title.trim() : event.title,
-      description: description ? description.trim() : event.description,
+      title: title || event.title,
+      description: description || event.description,
       date: date ? new Date(date) : event.date,
       time: time || event.time,
-      location: location ? location.trim() : event.location,
-      maxAttendees: maxAttendees ? parseInt(maxAttendees) : event.maxAttendees,
+      location: location || event.location,
+      maxAttendees: maxAttendees || event.maxAttendees,
       status: status || event.status
     };
 
@@ -434,92 +524,117 @@ app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), uplo
     }
 
     if (sessions) {
-      try {
-        updateData.sessions = JSON.parse(sessions);
-      } catch (sessionParseError) {
-        return res.status(400).json({ error: 'Invalid sessions format' });
-      }
+      updateData.sessions = JSON.parse(sessions);
     }
 
-    console.log('Updating event with data:', updateData);
     const updatedEvent = await Event.findByIdAndUpdate(
-      eventId,
+      req.params.id,
       updateData,
-      { new: true, runValidators: true }
+      { new: true }
     ).populate('organizer', 'firstName lastName email');
 
-    console.log('=== UPDATE EVENT SUCCESS ===');
     res.json({
       message: 'Event updated successfully',
       event: updatedEvent
     });
-
   } catch (error) {
-    console.error('=== UPDATE EVENT ERROR ===');
-    console.error('Error type:', error.name);
-    console.error('Error message:', error.message);
-    console.error('Error stack:', error.stack);
-    
-    if (error.name === 'ValidationError') {
-      const validationErrors = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({ 
-        error: 'Validation failed', 
-        details: validationErrors 
-      });
-    }
-
-    if (error.name === 'CastError') {
-      return res.status(400).json({ error: 'Invalid event ID format' });
-    }
-
-    res.status(500).json({ 
-      error: 'Failed to update event',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    console.error('Update event error:', error);
+    res.status(500).json({ error: 'Failed to update event' });
   }
 });
-app.delete('/api/events/:id', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
+
+app.post('/api/events', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
   try {
-    const eventId = req.params.id;
+    const { title, description, date, time, location, maxAttendees, sessions } = req.body;
 
-    // Validate event ID
-    if (!mongoose.Types.ObjectId.isValid(eventId)) {
-      return res.status(400).json({ error: 'Invalid event ID' });
-    }
+    const event = new Event({
+      title,
+      description,
+      date: new Date(date),
+      time,
+      location,
+      organizer: req.user.userId,
+      maxAttendees: maxAttendees || 100,
+      image: req.file ? req.file.filename : null,
+      sessions: sessions ? JSON.parse(sessions) : []
+    });
 
-    // Find event
-    const event = await Event.findById(eventId);
+    await event.save();
+    await event.populate('organizer', 'firstName lastName email');
+
+    res.status(201).json({
+      message: 'Event created successfully',
+      event
+    });
+  } catch (error) {
+    console.error('Create event error:', error);
+    res.status(500).json({ error: 'Failed to create event' });
+  }
+});
+
+app.put('/api/events/:id', authenticateToken, authorizeRole(['organizer']), upload.single('image'), async (req, res) => {
+  try {
+    const { title, description, date, time, location, maxAttendees, sessions, status } = req.body;
+
+    const event = await Event.findById(req.params.id);
     if (!event) {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    // Check authorization
+    if (event.organizer.toString() !== req.user.userId) {
+      return res.status(403).json({ error: 'Not authorized to update this event' });
+    }
+
+    const updateData = {
+      title: title || event.title,
+      description: description || event.description,
+      date: date ? new Date(date) : event.date,
+      time: time || event.time,
+      location: location || event.location,
+      maxAttendees: maxAttendees || event.maxAttendees,
+      status: status || event.status
+    };
+
+    if (req.file) {
+      updateData.image = req.file.filename;
+    }
+
+    if (sessions) {
+      updateData.sessions = JSON.parse(sessions);
+    }
+
+    const updatedEvent = await Event.findByIdAndUpdate(
+      req.params.id,
+      updateData,
+      { new: true }
+    ).populate('organizer', 'firstName lastName email');
+
+    res.json({
+      message: 'Event updated successfully',
+      event: updatedEvent
+    });
+  } catch (error) {
+    console.error('Update event error:', error);
+    res.status(500).json({ error: 'Failed to update event' });
+  }
+});
+
+app.delete('/api/events/:id', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
+  try {
+    const event = await Event.findById(req.params.id);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
     if (event.organizer.toString() !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized to delete this event' });
     }
 
-    // Check if event has registrations
-    const registrationCount = await Registration.countDocuments({ event: eventId });
-    if (registrationCount > 0) {
-      return res.status(400).json({ 
-        error: `Cannot delete event with ${registrationCount} registered attendees. Please contact attendees first.` 
-      });
-    }
+    await Event.findByIdAndDelete(req.params.id);
+    await Registration.deleteMany({ event: req.params.id });
+    await SessionTracking.deleteMany({ event: req.params.id });
 
-    // Delete the event
-    await Event.findByIdAndDelete(eventId);
-
-    // Also delete any remaining registrations (cleanup)
-    await Registration.deleteMany({ event: eventId });
-
-    // Delete any session tracking records
-    await SessionTracking.deleteMany({ event: eventId });
-
-    res.json({
-      message: 'Event deleted successfully',
-      eventId: eventId
-    });
-
+    res.json({ message: 'Event deleted successfully' });
   } catch (error) {
     console.error('Delete event error:', error);
     res.status(500).json({ error: 'Failed to delete event' });
@@ -545,22 +660,38 @@ app.post('/api/events/:eventId/register', authenticateToken, async (req, res) =>
     });
 
     if (existingRegistration) {
-      return res.status(400).json({ error: 'Already registered for this event' });
+      return res.status(400).json({ 
+        error: 'Already registered for this event',
+        registrationId: existingRegistration._id
+      });
     }
 
     // Check if event is full
     const registrationCount = await Registration.countDocuments({ event: eventId });
     if (registrationCount >= event.maxAttendees) {
-      return res.status(400).json({ error: 'Event is full' });
+      return res.status(400).json({ 
+        error: 'Event is full',
+        maxAttendees: event.maxAttendees,
+        currentRegistrations: registrationCount
+      });
     }
 
-    // Generate QR code
+    // Generate QR code data
     const qrData = {
       eventId,
       userId,
-      registrationId: new mongoose.Types.ObjectId().toString()
+      registrationId: new mongoose.Types.ObjectId().toString(),
+      timestamp: new Date().toISOString()
     };
-    const qrCode = await generateQRCode(qrData);
+
+    let qrCode;
+    try {
+      qrCode = await generateQRCode(qrData);
+    } catch (qrError) {
+      console.error('QR code generation failed:', qrError);
+      // Continue without QR code - it can be generated later
+      qrCode = null;
+    }
 
     // Create registration
     const registration = new Registration({
@@ -571,6 +702,8 @@ app.post('/api/events/:eventId/register', authenticateToken, async (req, res) =>
 
     await registration.save();
 
+    console.log(`Registration successful: User ${userId} for event ${event.title}`);
+
     res.status(201).json({
       message: 'Registration successful',
       registration: {
@@ -578,87 +711,75 @@ app.post('/api/events/:eventId/register', authenticateToken, async (req, res) =>
         eventId,
         qrCode,
         registrationDate: registration.registrationDate
+      },
+      event: {
+        title: event.title,
+        date: event.date,
+        location: event.location
       }
     });
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+    res.status(500).json({ 
+      error: 'Registration failed',
+      details: error.message 
+    });
   }
 });
 
-app.get('/api/my-events', authenticateToken, async (req, res) => {
+app.get('/api/events/:eventId/registrations', authenticateToken, async (req, res) => {
   try {
-    console.log('=== GET MY EVENTS ===');
-    console.log('User:', req.user);
+    const eventId = req.params.eventId;
 
-    if (req.user.role === 'organizer') {
-      // Get events created by organizer
-      const events = await Event.find({ organizer: req.user.userId })
-        .populate('organizer', 'firstName lastName email')
-        .sort({ date: 1 });
-      
-      console.log(`Found ${events.length} events for organizer`);
-      res.json(events);
-    } else {
-      // Get events registered by attendee
-      const registrations = await Registration.find({ attendee: req.user.userId })
-        .populate({
-          path: 'event',
-          populate: {
-            path: 'organizer',
-            select: 'firstName lastName email'
-          }
-        })
-        .sort({ 'event.date': 1 });
-      
-      const events = registrations.map(reg => ({
-        ...reg.event.toObject(),
-        registrationId: reg._id,
-        checkedIn: reg.checkedIn,
-        cluster: reg.cluster
-      }));
-      
-      console.log(`Found ${events.length} registered events for attendee`);
-      res.json(events);
+    // Check if user is organizer of the event
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
     }
+
+    if (event.organizer.toString() !== req.user.userId && req.user.role !== 'organizer') {
+      return res.status(403).json({ error: 'Not authorized to view registrations' });
+    }
+
+    const registrations = await Registration.find({ event: eventId })
+      .populate('attendee', 'firstName lastName email interests professionalRole')
+      .sort({ registrationDate: -1 });
+
+    // Add safety checks for populated data
+    const safeRegistrations = registrations.map(reg => ({
+      _id: reg._id,
+      event: reg.event,
+      attendee: reg.attendee ? {
+        _id: reg.attendee._id,
+        firstName: reg.attendee.firstName || 'Unknown',
+        lastName: reg.attendee.lastName || 'User',
+        email: reg.attendee.email || 'No email',
+        interests: reg.attendee.interests || [],
+        professionalRole: reg.attendee.professionalRole || 'Not specified'
+      } : {
+        _id: 'unknown',
+        firstName: 'Deleted',
+        lastName: 'User',
+        email: 'No email',
+        interests: [],
+        professionalRole: 'Not specified'
+      },
+      qrCode: reg.qrCode,
+      checkedIn: reg.checkedIn,
+      checkInTime: reg.checkInTime,
+      cluster: reg.cluster,
+      registrationDate: reg.registrationDate
+    }));
+
+    console.log(`Retrieved ${safeRegistrations.length} registrations for event ${event.title}`);
+
+    res.json(safeRegistrations);
   } catch (error) {
-    console.error('Get my events error:', error);
-    res.status(500).json({ error: 'Failed to fetch events' });
-  }
-});
-app.get('/api/events', async (req, res) => {
-  try {
-    console.log('=== GET ALL EVENTS ===');
-    console.log('Query params:', req.query);
-
-    const { search, status, limit = 50 } = req.query;
-    let query = {};
-
-    if (search && search.trim()) {
-      query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { location: { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    if (status && status.trim()) {
-      query.status = status;
-    }
-
-    console.log('MongoDB query:', query);
-
-    const events = await Event.find(query)
-      .populate('organizer', 'firstName lastName email')
-      .sort({ date: 1 })
-      .limit(parseInt(limit));
-
-    console.log(`Found ${events.length} events`);
-    res.json(events);
-
-  } catch (error) {
-    console.error('Get events error:', error);
-    res.status(500).json({ error: 'Failed to fetch events' });
+    console.error('Get registrations error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch registrations',
+      details: error.message 
+    });
   }
 });
 
@@ -674,24 +795,35 @@ app.post('/api/checkin', authenticateToken, async (req, res) => {
     let parsedData;
     try {
       parsedData = JSON.parse(qrData);
-    } catch (error) {
-      return res.status(400).json({ error: 'Invalid QR data format' });
+    } catch (parseError) {
+      console.error('QR data parse error:', parseError);
+      return res.status(400).json({ error: 'Invalid QR data format - must be valid JSON' });
     }
 
     const { eventId, userId } = parsedData;
+
+    if (!eventId || !userId) {
+      return res.status(400).json({ error: 'QR data missing required fields (eventId, userId)' });
+    }
 
     // Find registration
     const registration = await Registration.findOne({
       event: eventId,
       attendee: userId
-    }).populate('attendee', 'firstName lastName email');
+    }).populate('attendee', 'firstName lastName email').populate('event', 'title');
 
     if (!registration) {
-      return res.status(404).json({ error: 'Registration not found' });
+      return res.status(404).json({ 
+        error: 'Registration not found',
+        details: 'User is not registered for this event or invalid QR code'
+      });
     }
 
     if (registration.checkedIn) {
-      return res.status(400).json({ error: 'Already checked in' });
+      return res.status(400).json({ 
+        error: 'Already checked in',
+        checkInTime: registration.checkInTime
+      });
     }
 
     // Update check-in status
@@ -703,8 +835,11 @@ app.post('/api/checkin', authenticateToken, async (req, res) => {
     io.to(eventId).emit('checkin_update', {
       attendeeId: userId,
       attendeeName: `${registration.attendee.firstName} ${registration.attendee.lastName}`,
-      checkInTime: registration.checkInTime
+      checkInTime: registration.checkInTime,
+      eventTitle: registration.event.title
     });
+
+    console.log(`Check-in successful: ${registration.attendee.firstName} ${registration.attendee.lastName} for ${registration.event.title}`);
 
     res.json({
       message: 'Check-in successful',
@@ -712,23 +847,32 @@ app.post('/api/checkin', authenticateToken, async (req, res) => {
         name: `${registration.attendee.firstName} ${registration.attendee.lastName}`,
         email: registration.attendee.email,
         checkInTime: registration.checkInTime
+      },
+      event: {
+        title: registration.event.title
       }
     });
   } catch (error) {
     console.error('Check-in error:', error);
-    res.status(500).json({ error: 'Check-in failed' });
+    res.status(500).json({ 
+      error: 'Check-in failed',
+      details: error.message 
+    });
   }
 });
-
 app.post('/api/events/:eventId/checkin-manual', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
   try {
     const { attendeeId } = req.body;
     const eventId = req.params.eventId;
 
+    if (!attendeeId) {
+      return res.status(400).json({ error: 'Attendee ID required' });
+    }
+
     // Verify organizer owns the event
     const event = await Event.findById(eventId);
     if (!event || event.organizer.toString() !== req.user.userId) {
-      return res.status(403).json({ error: 'Not authorized' });
+      return res.status(403).json({ error: 'Not authorized to check in attendees for this event' });
     }
 
     // Find and update registration
@@ -738,7 +882,14 @@ app.post('/api/events/:eventId/checkin-manual', authenticateToken, authorizeRole
     }).populate('attendee', 'firstName lastName email');
 
     if (!registration) {
-      return res.status(404).json({ error: 'Registration not found' });
+      return res.status(404).json({ error: 'Registration not found for this attendee and event' });
+    }
+
+    if (registration.checkedIn) {
+      return res.status(400).json({ 
+        error: 'Attendee already checked in',
+        checkInTime: registration.checkInTime
+      });
     }
 
     registration.checkedIn = true;
@@ -749,8 +900,11 @@ app.post('/api/events/:eventId/checkin-manual', authenticateToken, authorizeRole
     io.to(eventId).emit('checkin_update', {
       attendeeId,
       attendeeName: `${registration.attendee.firstName} ${registration.attendee.lastName}`,
-      checkInTime: registration.checkInTime
+      checkInTime: registration.checkInTime,
+      type: 'manual'
     });
+
+    console.log(`Manual check-in successful: ${registration.attendee.firstName} ${registration.attendee.lastName}`);
 
     res.json({
       message: 'Manual check-in successful',
@@ -762,148 +916,486 @@ app.post('/api/events/:eventId/checkin-manual', authenticateToken, authorizeRole
     });
   } catch (error) {
     console.error('Manual check-in error:', error);
-    res.status(500).json({ error: 'Manual check-in failed' });
+    res.status(500).json({ 
+      error: 'Manual check-in failed',
+      details: error.message 
+    });
   }
 });
-
 // Clustering routes
 app.post('/api/events/:eventId/cluster', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
   try {
     const eventId = req.params.eventId;
     const { algorithm = 'kmeans', numClusters = 3 } = req.body;
 
-    // Verify organizer owns the event
+    console.log(`[AI-CLUSTERING] Starting for event ${eventId} with algorithm: ${algorithm}`);
+
+    // Verify event and authorization (same as before)
     const event = await Event.findById(eventId);
     if (!event || event.organizer.toString() !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    // Get registrations with attendee data
+    // Get registrations (same as before)
     const registrations = await Registration.find({ event: eventId })
       .populate('attendee', 'firstName lastName email interests professionalRole');
 
-    if (registrations.length === 0) {
-      return res.status(400).json({ error: 'No registrations found for clustering' });
+    const validRegistrations = registrations.filter(reg => reg.attendee);
+    
+    if (validRegistrations.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 attendees for clustering' });
     }
 
-    // Prepare data for clustering
-    const attendeeData = registrations.map(reg => ({
-      id: reg.attendee._id,
+    // Prepare data for AI service
+    const attendeeData = validRegistrations.map(reg => ({
+      id: reg.attendee._id.toString(),
       name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
-      email: reg.attendee.email,
-      interests: reg.attendee.interests || [],
+      email: reg.attendee.email || '',
+      interests: Array.isArray(reg.attendee.interests) ? reg.attendee.interests : [],
       professionalRole: reg.attendee.professionalRole || 'unknown'
     }));
 
-    try {
-      // Call clustering microservice
-      const response = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster`, {
-        data: attendeeData,
-        algorithm,
-        numClusters
-      });
+    console.log(`[AI-CLUSTERING] Prepared ${attendeeData.length} attendees for AI processing`);
 
-      const { clusters, metrics } = response.data;
+    // Try AI clustering service first
+    const CLUSTERING_SERVICE_URL = process.env.CLUSTERING_SERVICE_URL;
+    
+    if (CLUSTERING_SERVICE_URL) {
+      try {
+        console.log(`[AI-CLUSTERING] Calling AI service at: ${CLUSTERING_SERVICE_URL}`);
+        
+        const aiResponse = await axios.post(`${CLUSTERING_SERVICE_URL}/cluster`, {
+          data: attendeeData,
+          algorithm: algorithm,
+          numClusters: numClusters
+        }, {
+          timeout: 30000,
+          headers: { 'Content-Type': 'application/json' }
+        });
 
-      // Update registrations with cluster assignments
-      for (let i = 0; i < clusters.length; i++) {
-        const cluster = clusters[i];
-        for (const attendeeId of cluster) {
-          await Registration.findOneAndUpdate(
-            { event: eventId, attendee: attendeeId },
-            { cluster: `cluster_${i}` }
-          );
+        const { clusters, cluster_info, metrics } = aiResponse.data;
+        
+        console.log(`[AI-CLUSTERING] AI service success: ${clusters.length} clusters created`);
+
+        // Update database with AI cluster assignments
+        await Registration.updateMany({ event: eventId }, { $unset: { cluster: 1 } });
+        
+        for (let i = 0; i < clusters.length; i++) {
+          for (const attendeeId of clusters[i]) {
+            await Registration.findOneAndUpdate(
+              { event: eventId, attendee: attendeeId },
+              { cluster: `ai_cluster_${i}` }
+            );
+          }
         }
+
+        // Store AI clustering results in event
+        await Event.findByIdAndUpdate(eventId, {
+          $set: {
+            lastClusteringResults: {
+              algorithm,
+              service: 'AI',
+              metrics,
+              timestamp: new Date()
+            }
+          }
+        });
+
+        return res.json({
+          message: '🤖 AI clustering completed successfully!',
+          clusters,
+          cluster_info,
+          metrics: {
+            ...metrics,
+            service: 'AI Clustering Service',
+            algorithm_used: algorithm,
+            enhanced_features: ['ML algorithms', 'Interest analysis', 'Cluster insights']
+          },
+          totalAttendees: attendeeData.length,
+          aiPowered: true
+        });
+
+      } catch (aiError) {
+        console.warn(`[AI-CLUSTERING] AI service failed: ${aiError.message}, falling back to smart clustering`);
       }
-
-      res.json({
-        message: 'Clustering completed successfully',
-        clusters,
-        metrics,
-        totalAttendees: attendeeData.length
-      });
-    } catch (clusteringError) {
-      console.log('Clustering service unavailable, using fallback method');
-      
-      // Fallback: Simple rule-based clustering
-      const clusterMap = new Map();
-      const clusters = [];
-      
-      attendeeData.forEach(attendee => {
-        const key = attendee.professionalRole || 'general';
-        if (!clusterMap.has(key)) {
-          clusterMap.set(key, []);
-          clusters.push([]);
-        }
-        clusterMap.get(key).push(attendee.id);
-        clusters[clusters.length - 1].push(attendee.id);
-      });
-
-      // Update registrations with cluster assignments
-      let clusterIndex = 0;
-      for (const [role, attendeeIds] of clusterMap) {
-        for (const attendeeId of attendeeIds) {
-          await Registration.findOneAndUpdate(
-            { event: eventId, attendee: attendeeId },
-            { cluster: `cluster_${clusterIndex}` }
-          );
-        }
-        clusterIndex++;
-      }
-
-      const metrics = calculateClusteringMetrics(clusters);
-
-      res.json({
-        message: 'Clustering completed successfully (fallback method)',
-        clusters: Array.from(clusterMap.values()),
-        metrics,
-        totalAttendees: attendeeData.length
-      });
+    } else {
+      console.log(`[AI-CLUSTERING] No AI service URL configured, using smart clustering`);
     }
+
+    // Fallback to smart clustering (your existing logic)
+    console.log(`[AI-CLUSTERING] Using smart fallback clustering`);
+    const clusters = performSmartClustering(attendeeData, numClusters);
+    
+    // Update database with fallback clusters
+    await Registration.updateMany({ event: eventId }, { $unset: { cluster: 1 } });
+    
+    for (let i = 0; i < clusters.length; i++) {
+      for (const attendeeId of clusters[i]) {
+        await Registration.findOneAndUpdate(
+          { event: eventId, attendee: attendeeId },
+          { cluster: `smart_cluster_${i}` }
+        );
+      }
+    }
+
+    res.json({
+      message: '🧠 Smart clustering completed successfully!',
+      clusters,
+      metrics: {
+        service: 'Smart Fallback Clustering',
+        totalAttendees: attendeeData.length,
+        numClusters: clusters.length,
+        note: 'AI service unavailable - used intelligent role-based clustering'
+      },
+      totalAttendees: attendeeData.length,
+      aiPowered: false
+    });
+
   } catch (error) {
-    console.error('Clustering error:', error);
-    res.status(500).json({ error: 'Clustering failed' });
+    console.error('[AI-CLUSTERING] Error:', error);
+    res.status(500).json({ error: 'Clustering failed', details: error.message });
   }
 });
-
+// FIXED: Enhanced clusters GET route with comprehensive error handling
 app.get('/api/events/:eventId/clusters', authenticateToken, async (req, res) => {
   try {
     const eventId = req.params.eventId;
+    console.log(`[CLUSTERS] Fetching clusters for event ${eventId} by user ${req.user.userId}`);
+
+    // Verify event exists
+    const event = await Event.findById(eventId);
+    if (!event) {
+      console.log(`[CLUSTERS] Event ${eventId} not found`);
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    // Check access permissions
+    const isOrganizer = event.organizer.toString() === req.user.userId;
+    const isRegisteredAttendee = await Registration.findOne({ 
+      event: eventId, 
+      attendee: req.user.userId 
+    });
+
+    if (!isOrganizer && !isRegisteredAttendee) {
+      console.log(`[CLUSTERS] User ${req.user.userId} not authorized to view clusters for event ${eventId}`);
+      return res.status(403).json({ error: 'Not authorized to view clusters' });
+    }
+
+    console.log(`[CLUSTERS] User authorized as ${isOrganizer ? 'organizer' : 'attendee'}`);
 
     // Get registrations with cluster data
     const registrations = await Registration.find({ event: eventId })
       .populate('attendee', 'firstName lastName email interests professionalRole')
       .sort({ cluster: 1 });
 
-    // Group by cluster
+    console.log(`[CLUSTERS] Found ${registrations.length} registrations for clustering`);
+
+    if (registrations.length === 0) {
+      return res.json([]);
+    }
+
+    // Group by cluster with enhanced safety checks
     const clusterMap = new Map();
+    let processedCount = 0;
+    let skippedCount = 0;
+
     registrations.forEach(reg => {
+      if (!reg.attendee) {
+        console.warn(`[CLUSTERS] Registration ${reg._id} has no attendee data`);
+        skippedCount++;
+        return;
+      }
+
       const cluster = reg.cluster || 'unassigned';
       if (!clusterMap.has(cluster)) {
         clusterMap.set(cluster, []);
       }
-      clusterMap.get(cluster).push({
+      
+      // Create safe member data
+      const memberData = {
         id: reg.attendee._id,
-        name: `${reg.attendee.firstName} ${reg.attendee.lastName}`,
-        email: reg.attendee.email,
-        interests: reg.attendee.interests,
-        professionalRole: reg.attendee.professionalRole,
-        checkedIn: reg.checkedIn
-      });
+        name: `${reg.attendee.firstName || 'Unknown'} ${reg.attendee.lastName || 'User'}`,
+        email: isOrganizer ? (reg.attendee.email || 'No email') : 'hidden',
+        interests: Array.isArray(reg.attendee.interests) ? reg.attendee.interests : [],
+        professionalRole: reg.attendee.professionalRole || 'Not specified',
+        checkedIn: Boolean(reg.checkedIn),
+        checkInTime: reg.checkInTime || null
+      };
+      
+      clusterMap.get(cluster).push(memberData);
+      processedCount++;
     });
 
-    const clusters = Array.from(clusterMap.entries()).map(([name, members]) => ({
-      name,
-      members,
-      size: members.length
-    }));
+    console.log(`[CLUSTERS] Processed ${processedCount} registrations, skipped ${skippedCount}`);
+
+    // Convert to array format with enhanced cluster info
+    const clusters = Array.from(clusterMap.entries()).map(([name, members]) => {
+      const roles = members.map(m => m.professionalRole);
+      const interests = members.flatMap(m => m.interests);
+      const checkedInMembers = members.filter(m => m.checkedIn);
+
+      return {
+        name,
+        members,
+        size: members.length,
+        characteristics: {
+          dominantRole: getMostCommon(roles),
+          commonInterests: getMostCommonItems(interests, 3),
+          checkedInCount: checkedInMembers.length,
+          checkedInPercentage: members.length > 0 ? Math.round((checkedInMembers.length / members.length) * 100) : 0,
+          diversity: calculateDiversity(roles)
+        }
+      };
+    });
+
+    // Sort clusters by name to ensure consistent ordering
+    clusters.sort((a, b) => a.name.localeCompare(b.name));
+
+    console.log(`[CLUSTERS] Returning ${clusters.length} clusters with sizes:`, clusters.map(c => `${c.name}:${c.size}`));
 
     res.json(clusters);
+
   } catch (error) {
-    console.error('Get clusters error:', error);
-    res.status(500).json({ error: 'Failed to fetch clusters' });
+    console.error('[CLUSTERS] Error fetching clusters:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch clusters',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
+
+// Smart clustering function with role-based grouping
+function performSmartClustering(attendeeData, targetClusters) {
+  console.log(`[SMART_CLUSTERING] Starting with ${attendeeData.length} attendees, target: ${targetClusters} clusters`);
+  
+  try {
+    // Step 1: Group by normalized professional role
+    const roleGroups = new Map();
+    const unknownGroup = [];
+    
+    attendeeData.forEach(attendee => {
+      const role = attendee.professionalRole && attendee.professionalRole !== 'unknown' 
+        ? normalizeRole(attendee.professionalRole.toLowerCase().trim())
+        : null;
+      
+      if (role && role !== 'unknown' && role !== 'other') {
+        if (!roleGroups.has(role)) {
+          roleGroups.set(role, []);
+        }
+        roleGroups.get(role).push(attendee.id);
+      } else {
+        unknownGroup.push(attendee.id);
+      }
+    });
+
+    console.log(`[SMART_CLUSTERING] Role groups:`, Array.from(roleGroups.entries()).map(([role, members]) => `${role}:${members.length}`));
+    console.log(`[SMART_CLUSTERING] Unknown group size: ${unknownGroup.length}`);
+
+    // Step 2: Convert to clusters array
+    let clusters = Array.from(roleGroups.values());
+    
+    // Add unknown group if not empty
+    if (unknownGroup.length > 0) {
+      clusters.push(unknownGroup);
+    }
+
+    // Step 3: Balance clusters to target number
+    clusters = balanceClusters(clusters, targetClusters);
+
+    console.log(`[SMART_CLUSTERING] Final cluster sizes:`, clusters.map(c => c.length));
+    
+    return clusters;
+
+  } catch (error) {
+    console.error('[SMART_CLUSTERING] Error, falling back to simple clustering:', error);
+    return simpleEvenClustering(attendeeData, targetClusters);
+  }
+}
+
+// Normalize professional roles to standard categories
+function normalizeRole(role) {
+  const roleMapping = {
+    // Engineering roles
+    'software engineer': 'engineer',
+    'software developer': 'engineer',
+    'web developer': 'engineer',
+    'mobile developer': 'engineer',
+    'frontend developer': 'engineer',
+    'backend developer': 'engineer',
+    'full stack developer': 'engineer',
+    'fullstack developer': 'engineer',
+    'devops engineer': 'engineer',
+    'system engineer': 'engineer',
+    'developer': 'engineer',
+    'programmer': 'engineer',
+    
+    // Data roles
+    'data scientist': 'data_professional',
+    'data analyst': 'data_professional',
+    'machine learning engineer': 'data_professional',
+    'ml engineer': 'data_professional',
+    'data engineer': 'data_professional',
+    
+    // Research roles
+    'ai researcher': 'researcher',
+    'researcher': 'researcher',
+    'research scientist': 'researcher',
+    
+    // Design roles
+    'ux designer': 'designer',
+    'ui designer': 'designer',
+    'graphic designer': 'designer',
+    'product designer': 'designer',
+    'web designer': 'designer',
+    'designer': 'designer',
+    
+    // Management roles
+    'product manager': 'manager',
+    'project manager': 'manager',
+    'engineering manager': 'manager',
+    'marketing manager': 'manager',
+    'sales manager': 'manager',
+    'team lead': 'manager',
+    'tech lead': 'manager',
+    'manager': 'manager',
+    
+    // Executive roles
+    'ceo': 'executive',
+    'cto': 'executive',
+    'cfo': 'executive',
+    'vp': 'executive',
+    'director': 'executive',
+    
+    // Entrepreneur roles
+    'founder': 'entrepreneur',
+    'startup founder': 'entrepreneur',
+    'entrepreneur': 'entrepreneur',
+    
+    // Analyst roles
+    'business analyst': 'analyst',
+    'financial analyst': 'analyst',
+    'security analyst': 'analyst',
+    'systems analyst': 'analyst',
+    'analyst': 'analyst',
+    
+    // Other roles
+    'consultant': 'consultant',
+    'student': 'student',
+    'professor': 'academic',
+    'teacher': 'academic',
+    'intern': 'student'
+  };
+  
+  const cleanRole = role.toLowerCase().trim();
+  
+  // Direct match
+  if (roleMapping[cleanRole]) {
+    return roleMapping[cleanRole];
+  }
+  
+  // Partial matches for compound roles
+  for (const [key, value] of Object.entries(roleMapping)) {
+    if (cleanRole.includes(key) || key.includes(cleanRole)) {
+      return value;
+    }
+  }
+  
+  return 'other';
+}
+
+// Balance clusters to target number
+function balanceClusters(clusters, targetClusters) {
+  console.log(`[BALANCE] Input: ${clusters.length} clusters, target: ${targetClusters}`);
+  
+  // Remove empty clusters
+  clusters = clusters.filter(c => c.length > 0);
+  
+  // If we have too many clusters, merge smaller ones
+  if (clusters.length > targetClusters) {
+    clusters.sort((a, b) => b.length - a.length); // Sort by size descending
+    
+    const mainClusters = clusters.slice(0, targetClusters - 1);
+    const clustersToMerge = clusters.slice(targetClusters - 1);
+    const mergedCluster = clustersToMerge.flat();
+    
+    if (mergedCluster.length > 0) {
+      mainClusters.push(mergedCluster);
+    }
+    
+    clusters = mainClusters;
+  }
+
+  // If we have too few clusters, split the largest ones
+  while (clusters.length < targetClusters && clusters.some(c => c.length > 1)) {
+    const largestIndex = clusters.findIndex(c => c.length === Math.max(...clusters.map(cl => cl.length)));
+    const largestCluster = clusters[largestIndex];
+    
+    if (largestCluster.length > 1) {
+      const splitPoint = Math.ceil(largestCluster.length / 2);
+      const cluster1 = largestCluster.slice(0, splitPoint);
+      const cluster2 = largestCluster.slice(splitPoint);
+      
+      clusters[largestIndex] = cluster1;
+      clusters.push(cluster2);
+    } else {
+      break; // Can't split further
+    }
+  }
+
+  console.log(`[BALANCE] Output: ${clusters.length} clusters with sizes:`, clusters.map(c => c.length));
+  return clusters;
+}
+
+// Simple even clustering as fallback
+function simpleEvenClustering(attendeeData, targetClusters) {
+  console.log(`[SIMPLE_CLUSTERING] Creating ${targetClusters} even clusters for ${attendeeData.length} attendees`);
+  
+  const clusters = Array.from({ length: targetClusters }, () => []);
+  
+  attendeeData.forEach((attendee, index) => {
+    const clusterIndex = index % targetClusters;
+    clusters[clusterIndex].push(attendee.id);
+  });
+  
+  return clusters.filter(c => c.length > 0);
+}
+
+// Helper functions
+function getMostCommon(array) {
+  if (array.length === 0) return 'unknown';
+  
+  const counts = {};
+  array.forEach(item => {
+    counts[item] = (counts[item] || 0) + 1;
+  });
+  
+  return Object.keys(counts).reduce((a, b) => counts[a] > counts[b] ? a : b);
+}
+
+function getMostCommonItems(array, limit = 3) {
+  if (array.length === 0) return [];
+  
+  const counts = {};
+  array.forEach(item => {
+    if (item && item.trim()) { // Filter out empty interests
+      counts[item] = (counts[item] || 0) + 1;
+    }
+  });
+  
+  return Object.keys(counts)
+    .sort((a, b) => counts[b] - counts[a])
+    .slice(0, limit);
+}
+
+function calculateDiversity(roles) {
+  if (roles.length <= 1) return 0;
+  
+  const uniqueRoles = new Set(roles.filter(r => r && r !== 'unknown'));
+  return Math.round((uniqueRoles.size / roles.length) * 100) / 100;
+}
+
+console.log('✅ Enhanced clustering routes with comprehensive error handling loaded successfully');
 
 // Analytics routes
 app.get('/api/events/:eventId/analytics', authenticateToken, authorizeRole(['organizer']), async (req, res) => {
@@ -911,33 +1403,105 @@ app.get('/api/events/:eventId/analytics', authenticateToken, authorizeRole(['org
     const eventId = req.params.eventId;
 
     // Verify organizer owns the event
-    const event = await Event.findById(eventId);
-    if (!event || event.organizer.toString() !== req.user.userId) {
+    const event = await Event.findById(eventId).populate('organizer', 'firstName lastName');
+    if (!event || event.organizer._id.toString() !== req.user.userId) {
       return res.status(403).json({ error: 'Not authorized' });
     }
+
+    console.log(`Generating analytics for event: ${event.title}`);
 
     // Get analytics data
     const totalRegistrations = await Registration.countDocuments({ event: eventId });
     const totalCheckedIn = await Registration.countDocuments({ event: eventId, checkedIn: true });
-    const clusterCount = await Registration.distinct('cluster', { event: eventId });
+    const clusterData = await Registration.distinct('cluster', { event: eventId });
 
     // Get session tracking data
     const sessionData = await SessionTracking.find({ event: eventId })
       .populate('attendee', 'firstName lastName');
 
+    // Calculate session analytics if sessions exist
+    let sessionAnalytics = [];
+    if (event.sessions && event.sessions.length > 0) {
+      sessionAnalytics = event.sessions.map(session => {
+        const sessionTracking = sessionData.filter(s => s.session === session.title);
+        return {
+          title: session.title,
+          speaker: session.speaker || 'TBD',
+          startTime: session.startTime,
+          endTime: session.endTime,
+          totalJoins: sessionTracking.length,
+          avgDuration: sessionTracking.reduce((sum, s) => sum + (s.duration || 0), 0) / sessionTracking.length || 0,
+          engagementRate: Math.round((sessionTracking.length / Math.max(totalCheckedIn, 1)) * 100)
+        };
+      });
+    }
+
+    // Generate insights based on data
+    const insights = [];
+    
+    if (totalRegistrations > 0) {
+      const checkInRate = (totalCheckedIn / totalRegistrations * 100).toFixed(1);
+      insights.push(`Check-in rate: ${checkInRate}%`);
+      
+      if (checkInRate < 70) {
+        insights.push('Consider sending reminder emails to improve check-in rates');
+      }
+    }
+
+    if (sessionAnalytics.length > 0) {
+      const avgEngagement = sessionAnalytics.reduce((sum, s) => sum + s.engagementRate, 0) / sessionAnalytics.length;
+      insights.push(`Average session engagement: ${avgEngagement.toFixed(1)}%`);
+      
+      const mostPopular = sessionAnalytics.reduce((prev, current) => 
+        (prev.totalJoins > current.totalJoins) ? prev : current
+      );
+      insights.push(`Most popular session: "${mostPopular.title}" with ${mostPopular.totalJoins} joins`);
+    }
+
+    const clusterCount = clusterData.filter(c => c && c !== 'unassigned').length;
+    if (clusterCount > 0) {
+      insights.push(`Attendees organized into ${clusterCount} networking clusters`);
+    }
+
     const analytics = {
-      totalRegistrations,
-      totalCheckedIn,
-      checkInRate: totalRegistrations > 0 ? (totalCheckedIn / totalRegistrations * 100).toFixed(2) : 0,
-      totalClusters: clusterCount.filter(c => c && c !== 'unassigned').length,
-      sessionEngagement: sessionData.length,
-      avgSessionDuration: sessionData.reduce((sum, s) => sum + (s.duration || 0), 0) / sessionData.length || 0
+      eventInfo: {
+        title: event.title,
+        date: event.date,
+        organizer: `${event.organizer.firstName} ${event.organizer.lastName}`,
+        maxAttendees: event.maxAttendees
+      },
+      attendance: {
+        totalRegistrations,
+        totalCheckedIn,
+        checkInRate: totalRegistrations > 0 ? (totalCheckedIn / totalRegistrations * 100).toFixed(2) : 0,
+        noShowCount: totalRegistrations - totalCheckedIn
+      },
+      clustering: {
+        totalClusters: clusterCount,
+        clusteredAttendees: await Registration.countDocuments({ 
+          event: eventId, 
+          cluster: { $exists: true, $ne: null, $ne: 'unassigned' } 
+        })
+      },
+      sessions: {
+        totalSessions: event.sessions?.length || 0,
+        sessionDetails: sessionAnalytics,
+        totalSessionEngagement: sessionData.length,
+        avgSessionDuration: sessionData.reduce((sum, s) => sum + (s.duration || 0), 0) / sessionData.length || 0
+      },
+      insights,
+      generatedAt: new Date().toISOString()
     };
+
+    console.log(`Analytics generated successfully for ${analytics.attendance.totalRegistrations} registrations`);
 
     res.json(analytics);
   } catch (error) {
     console.error('Analytics error:', error);
-    res.status(500).json({ error: 'Failed to fetch analytics' });
+    res.status(500).json({ 
+      error: 'Failed to fetch analytics',
+      details: error.message 
+    });
   }
 });
 
@@ -1031,74 +1595,47 @@ app.post('/api/events/:eventId/sessions/:sessionId/leave', authenticateToken, as
 // User profile routes
 app.get('/api/profile', authenticateToken, async (req, res) => {
   try {
-    console.log('=== GET PROFILE ===');
-    console.log('User ID:', req.user.userId);
-
     const user = await User.findById(req.user.userId).select('-password');
+    
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    console.log('Profile loaded for:', user.email);
-    res.json(user);
+    // Ensure all required fields have default values
+    const safeProfile = {
+      _id: user._id,
+      username: user.username || '',
+      email: user.email || '',
+      firstName: user.firstName || '',
+      lastName: user.lastName || '',
+      role: user.role || 'attendee',
+      interests: user.interests || [],
+      professionalRole: user.professionalRole || '',
+      createdAt: user.createdAt || new Date()
+    };
+
+    res.json(safeProfile);
   } catch (error) {
     console.error('Get profile error:', error);
-    res.status(500).json({ error: 'Failed to fetch profile' });
-  }
-});
-
-app.put('/api/profile', authenticateToken, async (req, res) => {
-  try {
-    console.log('=== UPDATE PROFILE ===');
-    console.log('User ID:', req.user.userId);
-    console.log('Update data:', req.body);
-
-    const { firstName, lastName, interests, professionalRole } = req.body;
-    
-    const updatedUser = await User.findByIdAndUpdate(
-      req.user.userId,
-      { firstName, lastName, interests, professionalRole },
-      { new: true, runValidators: true }
-    ).select('-password');
-
-    if (!updatedUser) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    console.log('Profile updated for:', updatedUser.email);
-    res.json({
-      message: 'Profile updated successfully',
-      user: updatedUser
+    res.status(500).json({ 
+      error: 'Failed to fetch profile',
+      details: error.message 
     });
-  } catch (error) {
-    console.error('Update profile error:', error);
-    res.status(500).json({ error: 'Failed to update profile' });
   }
 });
+
 // My events route
 app.get('/api/my-events', authenticateToken, async (req, res) => {
   try {
-    console.log('=== GET MY EVENTS ===');
-    console.log('User:', req.user);
-
     if (req.user.role === 'organizer') {
       // Get events created by organizer
       const events = await Event.find({ organizer: req.user.userId })
-        .populate('organizer', 'firstName lastName email')
         .sort({ date: 1 });
-      
-      console.log(`Found ${events.length} events for organizer`);
       res.json(events);
     } else {
       // Get events registered by attendee
       const registrations = await Registration.find({ attendee: req.user.userId })
-        .populate({
-          path: 'event',
-          populate: {
-            path: 'organizer',
-            select: 'firstName lastName email'
-          }
-        })
+        .populate('event')
         .sort({ 'event.date': 1 });
       
       const events = registrations.map(reg => ({
@@ -1108,15 +1645,11 @@ app.get('/api/my-events', authenticateToken, async (req, res) => {
         cluster: reg.cluster
       }));
       
-      console.log(`Found ${events.length} registered events for attendee`);
       res.json(events);
     }
   } catch (error) {
     console.error('Get my events error:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch events',
-      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
-    });
+    res.status(500).json({ error: 'Failed to fetch events' });
   }
 });
 // Get attendee's own registration for an event (ADD THIS TO YOUR BACKEND)
@@ -1140,54 +1673,58 @@ app.get('/api/events/:eventId/my-registration', authenticateToken, async (req, r
     res.status(500).json({ error: 'Failed to fetch registration' });
   }
 });
+app.get('/api/test-uploads', (req, res) => {
+    const uploadsPath = path.join(__dirname, 'uploads');
+    
+    try {
+        const files = fs.readdirSync(uploadsPath);
+        res.json({
+            uploadsDirectory: uploadsPath,
+            exists: fs.existsSync(uploadsPath),
+            fileCount: files.length,
+            files: files.slice(0, 10), // Show first 10 files
+            permissions: fs.constants.F_OK
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Could not read uploads directory',
+            details: error.message,
+            uploadsPath
+        });
+    }
+});
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development'
-  });
-});
-// 6. Add request logging middleware for debugging
-app.use('/api', (req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
-  console.log('Headers:', req.headers);
-  if (req.body && Object.keys(req.body).length > 0) {
-    console.log('Body:', req.body);
+app.get('/api/health', async (req, res) => {
+  try {
+    // Check database connection
+    const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    
+    // Get some basic stats
+    const userCount = await User.countDocuments();
+    const eventCount = await Event.countDocuments();
+    const registrationCount = await Registration.countDocuments();
+
+    res.json({
+      status: 'OK',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      database: dbStatus,
+      stats: {
+        users: userCount,
+        events: eventCount,
+        registrations: registrationCount
+      },
+      version: '1.0.0'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'ERROR',
+      timestamp: new Date().toISOString(),
+      error: error.message
+    });
   }
-  next();
 });
-app.use('/api/*', (req, res) => {
-  console.log(`404 - Route not found: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ 
-    error: 'API route not found',
-    method: req.method,
-    path: req.originalUrl,
-    available_routes: [
-      'GET /api/health',
-      'POST /api/auth/login',
-      'POST /api/auth/register',
-      'GET /api/events',
-      'POST /api/events',
-      'GET /api/my-events',
-      'GET /api/profile',
-      'PUT /api/profile'
-    ]
-  });
-});
-app.use(cors({
-  origin: [
-    'http://localhost:3000',
-    'http://localhost:8080',
-    'http://127.0.0.1:5500',
-    'https://jamestan1496.github.io/CST_3990_Frontend/' // Add your actual frontend domain
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -1217,4 +1754,7 @@ process.on('SIGTERM', () => {
   });
 });
 
-module.exports = app;
+module.exports = {
+  generateQRCode,
+  calculateClusteringMetrics
+};
